@@ -570,18 +570,14 @@ packages:
           dynamic linking"). Skipping the find_package when benchmarks are
           disabled avoids the premature call entirely.
 
-      # 16. Add rocdecode/rocjpeg as RUNTIME_DEPS for rocprofiler-sdk (BUILD-FIXES #115)
-      - type: patch
-        path: "${VLLM_DIR}/patches/rocprofiler-sdk-rocdecode-deps.patch"
-        description: >-
-          Add rocdecode and rocjpeg to rocprofiler-sdk's RUNTIME_DEPS in
-          profiler/CMakeLists.txt. rocprofiler-sdk calls find_package(rocdecode)
-          and find_package(rocjpeg) in rocprofiler_config_interfaces.cmake, but
-          TheRock did not declare them as dependencies. Without this, rocdecode
-          is only configured (EXCLUDE_FROM_ALL) but never built/staged, leaving
-          rocdecode-config.cmake incomplete (missing rocdecode-targets.cmake and
-          include dir). The dep-provider then finds the broken config file,
-          causing a FATAL_ERROR during rocprofiler-sdk configure.
+      # 16. REMOVED (not upstream gfx115x default): "Add rocdecode/rocjpeg as
+      # RUNTIME_DEPS for rocprofiler-sdk" assumes THEROCK_ENABLE_MEDIA_LIBS=ON.
+      # This build sets it OFF (see cmake configure flags below), so the
+      # rocdecode/rocjpeg targets this patch references never exist, and
+      # get_target_property() on them is a hard FATAL_ERROR instead of the
+      # graceful case this patch was meant to fix. Superseded by patches 0a/0b
+      # which fix the same class of bug (forced super-project resolution of
+      # profiler-only components) at its actual source.
 
       # 17. Move media-libs before profiler in add_subdirectory order (BUILD-FIXES #115)
       - type: patch
