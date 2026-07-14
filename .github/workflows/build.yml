@@ -42,7 +42,7 @@ jobs:
           bison flex xxd scons meson \
           libvulkan-dev mesa-vulkan-drivers python3-dev python3-pip python3-venv \
           build-essential lsb-release procps \
-          libgl1-mesa-dev libglx-dev libopengl-dev
+          libgl1-mesa-dev libglx-dev libopengl-dev libsqlite3-dev
 
     - name: Install Clang 21 (TheRock requires >= 21)
       run: |
