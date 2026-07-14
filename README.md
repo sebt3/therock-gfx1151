@@ -1,6 +1,6 @@
 # therock-gfx1151
 
-TheRock ROCm SDK built from source for AMD Strix Halo / Strix Point (gfx1150/gfx1151, RDNA 3.5), published as an OCI image for downstream builds to consume.
+TheRock ROCm SDK built from source for AMD Strix Halo / Strix Point (gfx1150/gfx1151, RDNA 3.5), published as a `.tar.gz` GitHub Release asset for downstream builds to consume.
 
 This repo vendors [bitserv-ai/_gfx115x_](https://github.com/bitserv-ai/_gfx115x_)'s build pipeline (`build-vllm.sh` / `vllm-packages.yaml` / `patches/`), capped to `total_steps: 4` so only Phase A (TheRock clone/configure/build/validate) runs — none of AOCL, Python, PyTorch, Triton, vLLM, llama.cpp, or Lemonade.
 
@@ -16,10 +16,12 @@ Building the entire vLLM inference stack from source in one Dockerfile (TheRock 
 
 Two `sed` patches in `vllm-packages.yaml` (`0a`/`0b` on the `therock` package) are not upstream gfx115x — they fix a real bug in TheRock's own build: `THEROCK_SUPER_PROJECT_FIND_LIBRARY_NAMES`/`FIND_PATHS` force `roctx64`/`roctracer/roctx.h` to resolve from the super-project even though this build sets `THEROCK_ENABLE_PROFILER=OFF`, turning every downstream optional ROCTX probe (rocBLAS, hipBLASLt, hipSPARSELt, MIOpen, rocSPARSE, RCCL) into a hard `FATAL_ERROR` instead of the graceful `NOTFOUND` those projects already handle gracefully. Fixed once at the source instead of patching each downstream `CMakeLists.txt`.
 
-## Consuming the image
+## Consuming the release
 
-```dockerfile
-COPY --from=ghcr.io/sebt3/therock-gfx1151:latest / /opt/rocm
+```sh
+curl -fsSL -o therock.tar.gz \
+  https://github.com/sebt3/therock-gfx1151/releases/download/<tag>/therock-gfx1151-<tag>.tar.gz
+mkdir -p /opt/rocm && tar xzf therock.tar.gz -C /opt/rocm
 ```
 
 ## License
