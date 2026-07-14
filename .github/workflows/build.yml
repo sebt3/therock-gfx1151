@@ -63,22 +63,47 @@ jobs:
         sudo mkdir -p /opt/src/vllm
         sudo chown "$(id -u):$(id -g)" /opt/src/vllm
 
+    # Unique key per run so the cache save always happens (actions/cache
+    # refuses to overwrite an existing key); restore-keys picks up the
+    # most recent previous run's progress by prefix. Ninja's own state
+    # (.ninja_log, build.ninja, stamps) then makes the resumed run skip
+    # everything already completed instead of restarting cold.
     - name: Cache build tree
       uses: actions/cache@v4
       with:
         path: /opt/src/vllm
-        key: therock-build-${{ hashFiles('vllm-packages.yaml', 'patches/*.patch') }}
+        key: therock-build-${{ hashFiles('vllm-packages.yaml', 'patches/*.patch') }}-${{ github.run_id }}
         restore-keys: |
-          therock-build-
+          therock-build-${{ hashFiles('vllm-packages.yaml', 'patches/*.patch') }}-
 
+    # Leaves ~15min margin under the 6h job cap for the cache-save
+    # post-step to run. `|| true` means a timeout doesn't fail the step -
+    # completion is checked explicitly below via the therock-built marker,
+    # so a partial run still saves its cache and exits the job cleanly
+    # instead of getting killed and skipping the cache-save post-step
+    # (which is what happened when this ran with no timeout wrapper: the
+    # job hit an external shutdown signal and cache save was skipped
+    # entirely, losing 1h30 of progress).
     - name: Build TheRock
-      run: ./build-vllm.sh
+      run: timeout 5h45m ./build-vllm.sh || true
+
+    - name: Check build completed
+      id: check
+      run: |
+        if [ -x /opt/src/vllm/local/bin/hipcc ]; then
+          echo "done=true" >> $GITHUB_OUTPUT
+        else
+          echo "done=false" >> $GITHUB_OUTPUT
+          echo "::warning::TheRock build did not finish in this run; re-run the workflow to resume from cache."
+        fi
 
     - name: Package
+      if: steps.check.outputs.done == 'true'
       run: |
         tar czf therock-gfx1151-${{ steps.version.outputs.tag }}.tar.gz -C /opt/src/vllm/local .
 
     - name: Publish release
+      if: steps.check.outputs.done == 'true'
       uses: softprops/action-gh-release@v2
       with:
         tag_name: ${{ steps.version.outputs.tag }}
