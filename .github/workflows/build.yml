@@ -85,7 +85,7 @@ jobs:
     # job hit an external shutdown signal and cache save was skipped
     # entirely, losing 1h30 of progress).
     - name: Build TheRock
-      run: timeout 5h45m ./build-vllm.sh || true
+      run: timeout 345m ./build-vllm.sh || true
 
     - name: Check build completed
       id: check
