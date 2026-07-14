@@ -191,7 +191,7 @@ CPYTHON_VERSION="$(ycfg '.build.cpython_version')"
 CPYTHON_TAG="v${CPYTHON_VERSION}"
 
 # Unified install prefix — all C/C++ libraries install here.
-LOCAL_PREFIX="${VLLM_DIR}/local"
+export LOCAL_PREFIX="${VLLM_DIR}/local"
 
 # Ensure ROCm paths are globally exported for JIT compilers (AITER, Triton)
 export ROCM_PATH="${LOCAL_PREFIX}"
