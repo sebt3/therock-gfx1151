@@ -1,0 +1,2056 @@
+# vllm-packages.yaml - Package manifest for vLLM source build stack
+#
+# Single source of truth for the entire build pipeline. build-vllm.sh reads
+# this file via yq to resolve repository metadata, branches, source directories,
+# and prerequisite information. Separates package metadata from build orchestration.
+#
+# Sections:
+#   platform:      Hardware and OS environment this build targets
+#   build:         Build-wide configuration (paths, versions, step count)
+#   prerequisites: System packages required before building
+#   packages:      Per-component build metadata (repos, patches, notes)
+#
+# Field reference (packages):
+#   repo:        Git repository URL
+#   branch:      Git branch or tag (omit for default branch)
+#   recursive:   true to clone with --recurse-submodules
+#   src_dir:     Directory name under ${VLLM_DIR}/
+#   method:      Build system: cmake | scons | pip | autoconf | cargo | venv | export
+#   phase:       Build phase letter (A-I) for grouping
+#   steps:       List of step numbers this package covers
+#   depends_on:  Packages that must be built first
+#   skip_marker: File path relative to LOCAL_PREFIX indicating "already built"
+#                null means checked via wheel existence instead
+#   compiler:    Compiler to use: amdclang | gcc | system
+#   notes:       Important build findings and caveats (printed at step start)
+#   validation:  Commands to verify successful installation
+#   aiter_support: gfx1151 AITER compatibility notes (where applicable)
+#
+# Patch types:
+#   type: sed            - In-place sed replacement
+#     marker:            - grep pattern: if found, patch needed (or already applied)
+#     marker_absent:     - if true, marker ABSENCE means "needs patching" (default false)
+#     file:              - File path relative to src_dir (supports ${VAR} expansion)
+#     sed_command:       - Full sed expression
+#     description:       - Human-readable explanation
+#
+#   type: file_rewrite   - Replace entire file with new content
+#     marker:            - grep pattern in existing file that triggers rewrite
+#     file:              - File path relative to src_dir
+#     description:       - Human-readable explanation
+#     note:              - Content kept in build script (too complex for YAML)
+#
+#   type: prepend        - Prepend content to beginning of file
+#     marker:            - grep pattern indicating already patched
+#     file:              - File path relative to src_dir
+#     content_marker:    - Marker string embedded in prepended content
+#     description:       - Human-readable explanation
+#
+#   type: file_copy      - Copy file or directory between locations
+#     src:               - Source path (supports ${VAR} expansion)
+#     dst:               - Destination path (supports ${VAR} expansion)
+#     recursive:         - true for directory copy (cp -a)
+#     mode:              - Optional chmod mode (e.g. "+x")
+#     description:       - Human-readable explanation
+#
+#   type: patchelf_rpath - Modify ELF RPATH/RUNPATH entries
+#     target:            - Glob pattern for .so files to patch
+#     condition:         - readelf grep pattern triggering the fix
+#     rpath:             - New RPATH value (--set-rpath) or addition (--add-rpath)
+#     action:            - "set" (--set-rpath) or "add" (--add-rpath)
+#     description:       - Human-readable explanation
+#
+#   type: patchelf_needed - Add NEEDED dependency to ELF
+#     target:            - Specific .so file path
+#     library:           - Library name to add (e.g. librocm_smi64.so)
+#     condition:         - readelf grep pattern (absent = needs patching)
+#     description:       - Human-readable explanation
+
+# =============================================================================
+# Platform: hardware and OS this build targets
+# =============================================================================
+
+platform:
+  cpu: "AMD Zen 5 (Strix Halo / Ryzen AI Max)"
+  gpu: "RDNA 3.5 iGPU, gfx1151, 40 CUs"
+  gpu_arch: "gfx1151"
+  hsa_gfx_version: "11.5.1"
+  memory: "96 GB unified LPDDR5X (48 GB UMA + 48 GB System)"
+  distro: "CachyOS (Arch-based, rolling)"
+  kernel: "7.0.0-rc7-3-cachyos-rc (linux-cachyos-rc)"
+  kernel_min: "7.0"
+  kernel_modules:
+    - amdgpu
+    - amdxdna
+
+# =============================================================================
+# Build: pipeline-wide configuration
+# =============================================================================
+
+build:
+  vllm_dir: "/opt/src/vllm"
+  total_steps: 4
+  cpython_version: "3.13.9"
+  disk_required_gb: 100
+  clang_min_version: 21
+
+# =============================================================================
+# Smoke Test: tiny model used to validate all inference backends post-build
+# =============================================================================
+# SmolLM2-135M-Instruct: 135M params, ~270 MB FP16, ~70 MB Q4 GGUF.
+# Small enough to load in seconds on any GPU; large enough to prove the
+# full inference stack (tokenizer → model → sampling → detokenizer) works.
+
+smoke_test:
+  hf_model: "HuggingFaceTB/SmolLM2-135M-Instruct"
+  gguf_repo: "bartowski/SmolLM2-135M-Instruct-GGUF"
+  gguf_file: "SmolLM2-135M-Instruct-Q4_K_M.gguf"
+  prompt: "What is 2+2? Answer in one word."
+  max_tokens: 16
+
+# =============================================================================
+# Prerequisites: system packages and commands required before building
+# =============================================================================
+
+prerequisites:
+  # Commands that must be on PATH (checked by require_commands).
+  # uv and yq are NOT listed here — they are bootstrapped automatically
+  # if missing (see bootstrap_tools in build-vllm.sh).
+  required_commands:
+    - clang
+    - clang++
+    - lld
+    - cmake
+    - ninja
+    - git
+    - curl
+    - python3
+  # Additional build tools (checked individually with actionable errors)
+  build_tools:
+    - gfortran
+    - patchelf
+    - automake
+    - libtool
+    - bison
+    - flex
+    - xxd
+    - scons
+    - meson
+  # Tools that are auto-bootstrapped to LOCAL_PREFIX/bin if not on PATH.
+  # Also installed into the venv for self-contained builds.
+  bootstrap:
+    uv:
+      version: "0.7.12"
+      url_template: "https://github.com/astral-sh/uv/releases/download/{version}/uv-{arch}-unknown-linux-gnu.tar.gz"
+    yq:
+      # Version is auto-detected: go install (latest) or GitHub API latest release.
+      # url_template is only used as fallback when Go is not installed.
+      url_template: "https://github.com/mikefarah/yq/releases/download/v{version}/yq_linux_{goarch}"
+
+  # Per-distro package install commands. Keyed by /etc/os-release ID or
+  # ID_LIKE family. The script auto-detects the distro at runtime.
+  install_commands:
+    arch:
+      packages: >
+        sudo pacman -S clang lld cmake ninja git curl
+        gcc-fortran patchelf automake libtool bison flex xxd scons meson
+        vulkan-devel vulkan-radeon
+      kernel: "linux-cachyos-rc linux-cachyos-rc-headers"
+      notes: "uv and yq (go-yq) available via pacman: sudo pacman -S uv go-yq"
+    ubuntu:
+      packages: >
+        sudo apt-get install -y clang lld cmake ninja-build git curl
+        gfortran patchelf automake libtool bison flex xxd scons meson
+        libvulkan-dev mesa-vulkan-drivers python3-dev
+      kernel: "linux-headers-$(uname -r)"
+      notes: "uv and yq are auto-bootstrapped (not in apt repos)"
+    fedora:
+      packages: >
+        sudo dnf install -y clang lld cmake ninja-build git curl
+        gcc-gfortran patchelf automake libtool bison flex vim-common scons meson
+        vulkan-devel mesa-vulkan-drivers python3-devel
+      kernel: "kernel-devel"
+      notes: "uv and yq are auto-bootstrapped (not in dnf repos)"
+
+  # Device nodes that must exist
+  device_nodes:
+  - /dev/kfd
+  - /dev/dri/renderD128
+
+# =============================================================================
+# Steps: ordered build pipeline (step number -> shell function)
+# =============================================================================
+# build-vllm.sh iterates this list in order; --step N skips steps < N.
+# Steps with list values run all functions at that step number.
+
+steps:
+  # Phase A: ROCm SDK (TheRock)
+  #   clone:<pkg_key> entries are dispatched to clone_pkg() automatically.
+  #   All other entries are shell function names called directly.
+  1:  { clone: therock, desc: "TheRock ROCm source (with submodules)" }
+  2:  configure_therock
+  3:  build_therock
+  4:  validate_rocm
+
+  # Phase B: CPU Libraries + Python
+  5:  build_aocl_utils
+  6:  build_aocl_libm
+  7:  build_python
+  8:  create_venv
+
+  # Phase C: ML Framework (PyTorch + TorchVision)
+  9:  { clone: pytorch, desc: "PyTorch source (ROCm fork)" }
+  10: build_pytorch
+  11: validate_pytorch
+  12: { clone: torchvision, desc: "TorchVision source" }
+  13: build_torchvision
+
+  # Phase D: Kernel Compilers (Triton + AOTriton)
+  14: { clone: triton, desc: "Triton source (ROCm fork)" }
+  15: build_triton
+  16: validate_triton
+  17: { clone: aotriton, desc: "AOTriton (ahead-of-time Triton kernels)" }
+  18: build_aotriton
+
+  # Phase E: Inference Engine (vLLM)
+  19: { clone: vllm, desc: "vLLM source" }
+  20: [patch_amdsmi_import, patch_vllm_gfx1151]
+  21: install_build_deps
+  22: run_use_existing_torch
+  23: install_rocm_requirements
+  24: build_vllm
+
+  # Phase F: Attention (Flash Attention + AITER)
+  25: reinstall_amdsmi
+  26: { clone: flash_attention, desc: "Flash Attention (main_perf branch)" }
+  27: patch_flash_amdsmi
+  28: [build_flash_attention, rebuild_aiter, patch_aiter_gfx1151]
+
+  # Phase G: Validation + Warmup
+  29: [smoke_test, warmup_aiter_jit]
+
+  # Phase H: Optimized Wheels
+  30: build_rust_wheels
+  31: build_native_wheels
+  32: export_source_wheels
+
+  # Phase I: Lemonade Inference Server
+  33: clone_and_build_lemonade   # Builds llama.cpp with hipBLAS
+  34: install_lemonade_server   # Builds Lemonade Server from source
+  35: validate_lemonade          # Verifies server binaries and paths
+  36: backend_smoke_test         # Runs E2E tests for all inference backends
+
+
+# =============================================================================
+# Packages: per-component metadata (repos, patches, build notes)
+# =============================================================================
+
+packages:
+
+  # ---------------------------------------------------------------------------
+  # Phase A: ROCm SDK (TheRock)
+  # ---------------------------------------------------------------------------
+
+  therock:
+    repo: "https://github.com/ROCm/TheRock.git"
+    recursive: true
+    branch: "main"
+    commit: "a512f42c63d8de09f8769f33ca6a0a5ebea08043"
+    src_dir: "therock"
+    method: cmake
+    phase: A
+    steps: [1, 2, 3, 4]
+    depends_on: []
+    compiler: gcc
+    skip_marker: "lib/libamdhip64.so"
+    skip_check:
+      type: file_exists
+      path: "lib/libamdhip64.so"
+      paths:
+        - "lib/libhipblas.so"
+        - "bin/hipcc"
+        - "lib/llvm/bin/amdclang"
+    build_dependencies:
+      - joblib
+      - msgpack
+      - numpy
+      - pandas
+      - pyyaml
+      - pytest
+      - mako
+      - zstandard
+    notes: |
+      TheRock MUST be built with GCC -- rocprofiler-systems has an explicit
+      GNU compiler check that blocks Clang. TheRock produces amdclang (AMD's
+      LLVM fork with -famd-opt) which is used by ALL downstream components.
+
+      Build time: 2-4 hours on 16 cores.
+    validation:
+      - "test -x ${LOCAL_PREFIX}/bin/hipcc"
+      - "test -x ${LOCAL_PREFIX}/lib/llvm/bin/amdclang"
+      - "test -d ${LOCAL_PREFIX}/amdgcn/bitcode || test -d ${LOCAL_PREFIX}/llvm/amdgcn/bitcode"
+    patches:
+      # 0a. Exclude roctx64 from TheRock's forced super-project library resolution
+      - type: sed
+        file: "cmake/therock_explicit_finders.cmake"
+        marker: "  roctx64"
+        sed_command: "/^  roctx64$/d"
+        description: >
+          Remove roctx64 from THEROCK_SUPER_PROJECT_FIND_LIBRARY_NAMES.
+          THEROCK_ENABLE_PROFILER=OFF means roctracer/roctx64 are never
+          built, so forcing this name to resolve from the super-project
+          turns every downstream optional ROCTX probe (rocBLAS, hipBLASLt,
+          hipSPARSELt, MIOpen, rocSPARSE, RCCL) into a hard FATAL_ERROR
+          instead of the graceful NOTFOUND those projects already handle.
+
+      # 0b. Exclude roctracer/roctx.h from TheRock's forced super-project path resolution
+      - type: sed
+        file: "cmake/therock_explicit_finders.cmake"
+        marker: 'roctracer/roctx.h'
+        sed_command: '/"roctracer\/roctx.h"/d'
+        description: >
+          Remove roctracer/roctx.h from THEROCK_SUPER_PROJECT_FIND_PATHS,
+          same reasoning as the roctx64 library patch above.
+
+      # 1. Enable Polly polyhedral loop optimizer in LLVM build
+      - type: sed
+        file: "compiler/pre_hook_amd-llvm.cmake"
+        marker: "polly"
+        marker_absent: true
+        sed_command: "s|clang;lld;clang-tools-extra;flang|clang;lld;clang-tools-extra;flang;polly|"
+        description: >
+          Enable Polly polyhedral loop optimizer in LLVM build. Not in
+          default LLVM_ENABLE_PROJECTS but provides loop tiling and
+          vectorization benefits for downstream numerical code.
+
+      # 2. Disable -Werror in elfutils for modern compiler compat
+      - type: sed
+        file: "third-party/sysdeps/linux/elfutils/CMakeLists.txt"
+        marker: "Wno-error"
+        marker_absent: true
+        sed_command: 's|"CPPFLAGS=${EXTRA_CPPFLAGS}"|"CPPFLAGS=${EXTRA_CPPFLAGS}"\n      "CFLAGS=-Wno-error"|'
+        description: >
+          Disable -Werror in elfutils. Clang 21+ and GCC 15+ reject
+          implicit const void* -> struct* conversions from bsearch(),
+          which elfutils has in multiple call sites.
+
+      # 3-4. OBSOLETE — yaml-cpp and elfio OLD paths under external/rocprofiler-sdk/
+      # no longer exist in current TheRock source tree. Superseded by patches #13/#14
+      # (new path under rocm-systems/projects/rocprofiler-sdk/).
+
+      # 3. Copy MLIR object libraries to install tree
+      - type: file_copy
+        src: "${THEROCK_SRC}/build/compiler/amd-llvm/stage/lib/llvm/lib/objects-Release"
+        dst: "${LOCAL_PREFIX}/lib/llvm/lib/objects-Release"
+        recursive: true
+        description: >
+          Copy MLIR object libraries into install tree. TheRock's dist
+          aggregation copies .a and .so files but skips objects-Release/
+          directory that MLIR's cmake exports reference. Needed by Triton
+          when linking MLIR statically via LLVM_SYSPATH.
+
+      # 4. Install FileCheck binary for downstream consumers
+      - type: file_copy
+        src: "${THEROCK_SRC}/build/compiler/amd-llvm/build/bin/FileCheck"
+        dst: "${LOCAL_PREFIX}/lib/llvm/bin/FileCheck"
+        mode: "+x"
+        description: >
+          Install FileCheck into LLVM toolchain. Required by Triton's
+          cmake which unconditionally copies it into the wheel. TheRock
+          builds it but doesn't install it when THEROCK_BUILD_TESTING=OFF.
+
+      # 5. Skip roctx64 patch hooks when profiler stack is disabled (BUILD-FIXES #105)
+      # Replaces old #56/#57 (hard-wired roctx64 paths) with proper gating.
+      - type: sed
+        file: comm-libs/pre_hook_rccl.cmake
+        description: >-
+          Skip RCCL's legacy roctx64 link patch when TheRock profiler support
+          is disabled. The top-level build config sets THEROCK_ENABLE_PROFILER=OFF,
+          so roctracer/roctx64 are intentionally unavailable and should not be
+          hard-required during RCCL configure.
+        marker: 'if(NOT WIN32 AND THEROCK_ENABLE_PROFILER)'
+        marker_absent: true
+        sed_command: 's|if(NOT WIN32)|if(NOT WIN32 AND THEROCK_ENABLE_PROFILER)|'
+
+      - type: sed
+        file: math-libs/BLAS/pre_hook_rocBLAS.cmake
+        description: >-
+          Skip rocBLAS' legacy roctx64 link patch when the profiler stack is
+          disabled, matching the top-level THEROCK_ENABLE_PROFILER=OFF build.
+        marker: 'if(NOT WIN32 AND THEROCK_ENABLE_PROFILER)'
+        marker_absent: true
+        sed_command: 's|if(NOT WIN32)|if(NOT WIN32 AND THEROCK_ENABLE_PROFILER)|'
+
+      - type: sed
+        file: math-libs/BLAS/pre_hook_rocSPARSE.cmake
+        description: >-
+          Skip rocSPARSE's legacy roctx64 link patch when the profiler stack
+          is disabled, avoiding the same missing-roctx64 configure failure
+          later in the math library build.
+        marker: 'if(NOT WIN32 AND THEROCK_ENABLE_PROFILER)'
+        marker_absent: true
+        sed_command: 's|if(NOT WIN32)|if(NOT WIN32 AND THEROCK_ENABLE_PROFILER)|'
+
+      # 6. Disable RCCL ROCTX tracing when profiler stack is disabled (BUILD-FIXES #106)
+      - type: sed
+        file: comm-libs/CMakeLists.txt
+        description: >-
+          Disable RCCL's optional ROCTX tracing integration. Upstream RCCL
+          enables ROCTX by default and later calls find_library(roctx64),
+          which fails under TheRock builds configured with
+          THEROCK_ENABLE_PROFILER=OFF because roctracer/roctx64 are not built.
+        marker: '-DROCTX=OFF'
+        marker_absent: true
+        sed_command: '/-DENABLE_MSCCL_KERNEL=OFF/a\      -DROCTX=OFF'
+
+      # 7. Restore RCCL tuner macro definitions before rccl_common.h uses them (BUILD-FIXES #107)
+      - type: sed
+        file: rocm-systems/projects/rccl/src/include/rccl_common.h
+        description: >-
+          Ensure RCCL's internal tuner macros are visible before rccl_common.h
+          references NCCL_NUM_ALGORITHMS and NCCL_NUM_PROTOCOLS. The current
+          RCCL snapshot defines those macros in plugin/nccl_tuner.h, so newer
+          rccl_common.h revisions fail to compile if that header is not pulled
+          in explicitly.
+        marker: '#include "plugin/nccl_tuner.h"'
+        marker_absent: true
+        sed_command: |-
+          /#include "nccl.h"/a\
+          #include "plugin\/nccl_tuner.h"
+
+      # 8. Make RCCL's NVTX header honor stub-only build (BUILD-FIXES #108)
+      - type: sed
+        file: rocm-systems/projects/rccl/src/include/nvtx.h
+        description: >-
+          Make RCCL's nvtx.h defer to nvtx_stub.h when TheRock passes
+          -DNVTX_NO_IMPL. Some sources include nvtx.h directly instead of going
+          through core.h, so without this guard the real NVTX declarations and
+          stub declarations are both compiled, causing nccl_domain and macro
+          redefinition errors.
+        marker: '#ifdef NVTX_NO_IMPL'
+        marker_absent: true
+        sed_command: |-
+          /^#define NCCL_NVTX_H_$/a\
+          #ifdef NVTX_NO_IMPL\
+          #include "nvtx_stub.h"\
+          #else
+
+      - type: sed
+        file: rocm-systems/projects/rccl/src/include/nvtx.h
+        description: >-
+          Close the NVTX_NO_IMPL guard added to RCCL's nvtx.h so profiler-
+          disabled builds consistently use the stub header path.
+        marker: '#endif // NVTX_NO_IMPL'
+        marker_absent: true
+        sed_command: |-
+          $i\
+          #endif // NVTX_NO_IMPL
+
+      - type: sed
+        file: rocm-systems/projects/rccl/src/include/nvtx_stub.h
+        description: >-
+          Extend RCCL's NVTX stub header with a no-op NCCL_NVTX3_FUNC_RANGE
+          definition. Several sources use that macro through core.h, so once
+          nvtx.h honors NVTX_NO_IMPL the stub path must also provide the same
+          API surface.
+        marker: '#define NCCL_NVTX3_FUNC_RANGE'
+        marker_absent: true
+        sed_command: |-
+          /#define NVTX3_RANGE_ADD_PAYLOAD(N, S, P)/a\
+          #define NCCL_NVTX3_FUNC_RANGE
+
+      # 9. Disable hipBLASLt/hipSPARSELt/MIOpen ROCTX markers when profiler disabled (BUILD-FIXES #109)
+      - type: sed
+        file: math-libs/BLAS/CMakeLists.txt
+        description: >-
+          Disable hipBLASLt's optional ROCTX marker integration. hipBLASLt
+          enables markers by default when BUILD_SHARED_LIBS is on, and then
+          hard-fails if roctx64 is not present. That conflicts with
+          THEROCK_ENABLE_PROFILER=OFF, where roctracer/roctx64 are intentionally
+          not built.
+        marker: '-DHIPBLASLT_ENABLE_MARKER=OFF'
+        marker_absent: true
+        sed_command: '/-DHIPBLASLT_ENABLE_THEROCK=ON/a\    -DHIPBLASLT_ENABLE_MARKER=OFF'
+
+      - type: sed
+        file: math-libs/BLAS/CMakeLists.txt
+        description: >-
+          Disable hipSPARSELt's optional ROCTX marker integration. hipSPARSELt
+          defaults HIPSPARSELT_ENABLE_MARKER to ON on non-Windows builds and
+          then hard-requires roctx64/roctracer during configure, which is
+          incompatible with THEROCK_ENABLE_PROFILER=OFF.
+        marker: '-DHIPSPARSELT_ENABLE_MARKER=OFF'
+        marker_absent: true
+        sed_command: '/-DHIPSPARSELT_ENABLE_THEROCK=ON/a\    -DHIPSPARSELT_ENABLE_MARKER=OFF'
+
+      - type: sed
+        file: ml-libs/CMakeLists.txt
+        description: >-
+          Disable MIOpen's optional rocTracer/ROCTX integration. MIOpen
+          enables MIOPEN_USE_ROCTRACER by default and then probes for
+          roctracer/roctx.h and roctx64 during configure, which fails when
+          THEROCK_ENABLE_PROFILER=OFF intentionally omits the profiler stack.
+        marker: '-DMIOPEN_USE_ROCTRACER=OFF'
+        marker_absent: true
+        sed_command: '/-DMIOPEN_USE_COMPOSABLEKERNEL=/a\      -DMIOPEN_USE_ROCTRACER=OFF'
+
+      # 10. Disable rocBLAS ROCTX integration when profiler stack is disabled (BUILD-FIXES #110)
+      - type: sed
+        file: math-libs/BLAS/CMakeLists.txt
+        description: >-
+          Disable rocBLAS's optional ROCTX integration. rocBLAS later probes
+          for roctracer headers and roctx when this path is enabled, which
+          conflicts with THEROCK_ENABLE_PROFILER=OFF where those profiler
+          components are intentionally unavailable.
+        marker: '-DROCTX=OFF'
+        marker_absent: true
+        sed_command: '0,/-DLINK_BLIS=OFF/s//-DLINK_BLIS=OFF\n    -DROCTX=OFF/'
+
+      # 11. Disable rocSPARSE BUILD_WITH_ROCTX when profiler stack is disabled (BUILD-FIXES #111)
+      - type: sed
+        file: math-libs/BLAS/CMakeLists.txt
+        description: >-
+          Disable rocSPARSE's optional ROCTX tracing path at the TheRock
+          subproject layer. rocSPARSE already guards its roctx header/library
+          probing with BUILD_WITH_ROCTX, but TheRock does not currently pass
+          that option, so profiler-disabled builds still fail in the explicit
+          find_path/find_library override.
+        marker: '-DBUILD_WITH_ROCTX=OFF'
+        marker_absent: true
+        sed_command: '0,/-DBUILD_CLIENTS_SAMPLES=OFF/s//-DBUILD_CLIENTS_SAMPLES=OFF\n    -DBUILD_WITH_ROCTX=OFF/'
+
+      # 12. Disable atomic_codegen tests in libhipcxx to prevent build failures
+      - type: sed
+        file: math-libs/libhipcxx/test/atomic_codegen/CMakeLists.txt
+        description: >-
+          Disable atomic_codegen tests to prevent build failures. These tests
+          require device-side atomics that are not available or not correctly
+          configured for gfx1151 at TheRock build time. The tests are not
+          required for the runtime library.
+        marker: '# atomics_tests disabled'
+        marker_absent: true
+        sed_command: s/atomics_tests/# atomics_tests disabled/
+
+      # 13. Add missing <cstdint> include to yaml-cpp emitterutils.cpp (rocprofiler-sdk)
+      - type: sed
+        file: rocm-systems/projects/rocprofiler-sdk/external/yaml-cpp/src/emitterutils.cpp
+        description: >-
+          Add missing <cstdint> include to yaml-cpp emitterutils.cpp inside
+          rocprofiler-sdk. Clang 18+ and GCC 13+ removed the transitive
+          <cstdint> include from <algorithm>, breaking uint32_t usage in this
+          file. Mirrors the identical fix applied to the top-level
+          external/rocprofiler-sdk copy.
+        marker: <cstdint>
+        marker_absent: true
+        sed_command: '/#include <sstream>/a #include <cstdint>'
+
+      # 14. Add missing <cstdint> include to elfio elf_types.hpp (rocprofiler-sdk)
+      - type: sed
+        file: rocm-systems/projects/rocprofiler-sdk/external/elfio/elfio/elf_types.hpp
+        description: >-
+          Add missing <cstdint> include to elfio elf_types.hpp inside
+          rocprofiler-sdk. Same transitive include removal as yaml-cpp above ?
+          uint8_t and related types are no longer implicitly available without
+          explicit <cstdint>. Mirrors the fix applied to the top-level
+          external/elfio copy.
+        marker: <cstdint>
+        marker_absent: true
+        sed_command: '/#define ELFTYPES_H/i #include <cstdint>'
+
+      # 15. Guard primlibs benchmark deps find_package(amd_smi) with BUILD_BENCHMARK (BUILD-FIXES #114)
+      - type: patch
+        path: "${VLLM_DIR}/patches/therock-primlibs-benchmark-deps.patch"
+        description: >-
+          Guard find_package(amd_smi) in therock_primlibs_benchmark_deps.cmake
+          with BUILD_BENCHMARK. The file is included via CMAKE_INCLUDES in
+          _init.cmake, which runs before project() via
+          CMAKE_PROJECT_TOP_LEVEL_INCLUDES. Calling find_package(amd_smi) before
+          project() causes add_library(SHARED IMPORTED) to fail because
+          CMAKE_SYSTEM_NAME is not yet set ("target platform does not support
+          dynamic linking"). Skipping the find_package when benchmarks are
+          disabled avoids the premature call entirely.
+
+      # 16. Add rocdecode/rocjpeg as RUNTIME_DEPS for rocprofiler-sdk (BUILD-FIXES #115)
+      - type: patch
+        path: "${VLLM_DIR}/patches/rocprofiler-sdk-rocdecode-deps.patch"
+        description: >-
+          Add rocdecode and rocjpeg to rocprofiler-sdk's RUNTIME_DEPS in
+          profiler/CMakeLists.txt. rocprofiler-sdk calls find_package(rocdecode)
+          and find_package(rocjpeg) in rocprofiler_config_interfaces.cmake, but
+          TheRock did not declare them as dependencies. Without this, rocdecode
+          is only configured (EXCLUDE_FROM_ALL) but never built/staged, leaving
+          rocdecode-config.cmake incomplete (missing rocdecode-targets.cmake and
+          include dir). The dep-provider then finds the broken config file,
+          causing a FATAL_ERROR during rocprofiler-sdk configure.
+
+      # 17. Move media-libs before profiler in add_subdirectory order (BUILD-FIXES #115)
+      - type: patch
+        path: "${VLLM_DIR}/patches/therock-media-libs-before-profiler.patch"
+        description: >-
+          Move add_subdirectory(media-libs) before add_subdirectory(profiler)
+          in TheRock's root CMakeLists.txt. Patch #16 adds rocdecode/rocjpeg as
+          RUNTIME_DEPS to rocprofiler-sdk, but therock_cmake_subproject_declare
+          calls _therock_assert_is_cmake_subproject which does get_target_property
+          on each dep — the targets must already exist. Since rocdecode/rocjpeg
+          are declared in media-libs/CMakeLists.txt, media-libs must be processed
+          before profiler. rocdecode/rocjpeg only depend on base, core, and
+          third-party/sysdeps (all processed before both), so this reordering
+          is safe.
+
+      # 18. dep-provider: NO_CMAKE_PACKAGE_REGISTRY (BUILD-FIXES #118)
+      - type: patch
+        path: "${VLLM_DIR}/patches/therock-dep-provider-no-registry.patch"
+        description: >-
+          TheRock's dep-provider rewrites find_package() with NO_DEFAULT_PATH
+          but omits NO_CMAKE_PACKAGE_REGISTRY. CMake's NO_DEFAULT_PATH does
+          NOT exclude the User Package Registry (~/.cmake/packages/).
+          Subprojects like rocdecode call export(PACKAGE) which registers
+          their build/ directory in the registry. When a later subproject
+          (e.g. rocprofiler-sdk) calls find_package(rocdecode), CMake finds
+          the build/ version via the registry instead of the dist/ version
+          from PATHS. The build/ rocdecode-config.cmake resolves
+          PACKAGE_PREFIX_DIR incorrectly (build/../../../ → wrong path),
+          causing FATAL_ERROR on missing include dirs. Adding
+          NO_CMAKE_PACKAGE_REGISTRY forces CMake to use only the explicit
+          PATHS from the dep-provider.
+
+    environment:
+      BUILD_DOCS: "OFF"
+      BUILD_DOXYGEN: "OFF"
+      ENABLE_SYSTEM_HSA: "OFF"
+      CMAKE_HIP_ARCHITECTURES: "gfx1151"
+      AMDGPU_TARGETS: "gfx1151"
+      GPU_TARGETS: "gfx1151"
+      THEROCK_SKIP_DOCS: "ON"
+      HSA_KMT_DEBUG: "OFF"
+      CMAKE_INCLUDE_PATH: "${LOCAL_PREFIX}/include"
+      CMAKE_LIBRARY_PATH: "${LOCAL_PREFIX}/lib"
+
+  # ---------------------------------------------------------------------------
+  # Phase B: CPU Libraries + Python
+  # ---------------------------------------------------------------------------
+
+  aocl_utils:
+    repo: "https://github.com/amd/aocl-utils.git"
+    branch: "main"
+    commit: "deb418767224511d146fc5e6841a55a6f69e5e79"
+    src_dir: "aocl-utils"
+    method: cmake
+    phase: B
+    steps: [5]
+    depends_on: [therock]
+    compiler: amdclang
+    skip_marker: "lib/libaoclutils.so"
+    skip_check:
+      type: file_exists
+      path: "lib/libaoclutils.so"
+    notes: |
+      CPU feature detection library for AOCL-LibM.
+
+      Built WITHOUT LTO: AOCL-LibM links this .a with GNU ld (needed for
+      its hand-written AVX assembly), and GNU ld cannot read LLVM bitcode
+      objects that LTO produces.
+
+      Built WITHOUT clang-tidy: TheRock's clang-tidy crashes on AOCL-Utils
+      cleanup phase, and system clang-tidy doesn't understand -famd-opt.
+      CMAKE_CXX_CLANG_TIDY=/bin/true prevents auto-detection.
+
+  aocl_libm:
+    repo: "https://github.com/amd/aocl-libm-ose.git"
+    branch: "master"
+    commit: "86223910103068db48f42d9cc59c0bf3fc46fa5f"
+    src_dir: "aocl-libm"
+    method: scons
+    phase: B
+    steps: [6]
+    depends_on: [therock, aocl_utils]
+    compiler: amdclang
+    skip_marker: "lib/libalm.so"
+    skip_check:
+      type: file_exists
+      path: "lib/libalm.so"
+    notes: |
+      Zen 5 optimized transcendentals (exp, log, sin, cos, pow) with
+      AVX-512 codepaths for native 512-bit execution on Strix Halo.
+
+      NOT linked into CPython directly: AOCL-LibM has slightly different
+      ULP rounding than glibc libm (cbrt(-0.0) -> +0.0, nextafter broken
+      for subnormals), which causes CPython's PGO test_math to fail.
+      Available at runtime via LD_LIBRARY_PATH for NumPy and PyTorch.
+    patches:
+      # 1. Remove AOCC-only compiler flag
+      - type: sed
+        file: "src/SConscript"
+        marker: "muse-unaligned-vector-move"
+        marker_absent: true
+        sed_command: "s/ccflags.append('-muse-unaligned-vector-move')/pass  # patched: AOCC-only flag removed for amdclang/"
+        description: >
+          Remove -muse-unaligned-vector-move flag. This is AOCC-only;
+          TheRock's open-source amdclang doesn't support it. The -famd-opt
+          flag covers equivalent optimizations.
+
+      # 2. Suppress macro redefinition warnings
+      - type: sed
+        file: "src/SConscript"
+        marker: "Wno-macro-redefined"
+        marker_absent: true
+        sed_command: "s/'-Werror'/'-Werror', '-Wno-macro-redefined'/"
+        description: >
+          Add -Wno-macro-redefined to suppress CMPLX/CMPLXF macro
+          redefinition warnings. These macros are defined in both
+          AOCL-LibM headers and glibc complex.h.
+
+      # 3. OBSOLETE — linker flags fixed upstream in AOCL 5.3 (commit 86223910).
+      # Upstream changed '-ealm_main' → '-Wl,-ealm_main'. lld (TheRock LLVM 23)
+      # handles absolute relocations via TEXTREL without -fuse-ld=bfd. Verified:
+      # libalm.so has TEXTREL flag, built with amdclang 23.0.0.
+      # Previously: s|'-ealm_main'|'-Wl,-e,alm_main', '-fuse-ld=bfd'|
+
+      # 4. Fix libalm.so RPATH for libau_cpuid.so resolution
+      - type: patchelf_rpath
+        target: "${LOCAL_PREFIX}/lib/libalm.so"
+        condition: "libalm.so does not contain LOCAL_PREFIX in RPATH"
+        rpath: "${LOCAL_PREFIX}/lib"
+        action: add
+        description: >
+          Add RPATH to libalm.so so it finds libau_cpuid.so (from
+          AOCL-Utils) in the same directory at runtime without needing
+          LD_LIBRARY_PATH.
+
+  cpython:
+    repo: "https://github.com/python/cpython.git"
+    branch: "v3.13.9"
+    commit: "8f61118196ba00747076def18ea7ad2c43a1dc05"
+    src_dir: "cpython"
+    method: autoconf
+    phase: B
+    steps: [7]
+    depends_on: [therock]
+    compiler: amdclang
+    skip_marker: "bin/python3"
+    skip_check:
+      type: file_exists
+      path: "bin/python3"
+    notes: |
+      Python 3.13 built with PGO + LTO + amdclang for Zen 5.
+
+      PGO (Profile-Guided Optimization): runs the test suite as training
+      data, then recompiles with branch prediction hints. LTO (thin):
+      whole-program optimization across translation units.
+
+      CRITICAL: Must unset ALL vllm-env.sh flags before configure.
+      vllm-env.sh sets LDFLAGS=-lalm which autoconf merges with configure
+      LDFLAGS, causing AOCL-LibM to be linked, which breaks PGO training
+      (test_math fails on signed zero and subnormal number handling).
+
+      vllm-env.sh is re-sourced after build to restore flags.
+
+  venv:
+    src_dir: ".venv"
+    method: venv
+    phase: B
+    steps: [8]
+    depends_on: [cpython]
+    build_dependencies:
+      - pip
+      - ninja
+      - cmake
+      - wheel
+      - "setuptools<80"
+      - "CppHeaderParser==2.7.4"
+      - meson
+      - PyYAML
+      - packaging
+      - mako
+    notes: |
+      Virtual environment using our source-built Python 3.13.
+      If the venv exists but points to a different Python binary
+      (e.g., system python), it is recreated with our build.
+
+      Essential build tools installed: pip, ninja, cmake, wheel, setuptools,
+      CppHeaderParser, meson, PyYAML, packaging, mako.
+
+  # ---------------------------------------------------------------------------
+  # Phase C: ML Framework
+  # ---------------------------------------------------------------------------
+
+  pytorch:
+    repo: "https://github.com/ROCm/pytorch.git"
+    branch: "release/2.11"
+    commit: "9df77ad5fc2dabcf31fd25ddea60625901476d8b"
+    src_dir: "pytorch"
+    # Clone flags: ROCm fork validation + hipified file cleanup
+    validate_remote: "ROCm/pytorch"
+    clean_generated: true
+    method: pip
+    phase: C
+    steps: [9, 10, 11]
+    depends_on: [therock, cpython]
+    compiler: amdclang
+    skip_marker: null
+    skip_check:
+      # Note: torch.cuda.is_available() requires a GPU driver at build time.
+      # On Strix Halo (integrated GPU always present) this is safe. For
+      # headless build hosts without amdgpu driver, this check will fail and
+      # force a rebuild. The 'rocm' path fallback helps but is insufficient
+      # if the wheel was installed into the venv (not from source tree).
+      type: import
+      command: "import torch; print(torch.__version__) if ('rocm' in torch.__file__.lower() or torch.cuda.is_available()) else exit(1)"
+      workdir: "${VLLM_DIR}"
+    environment:
+      USE_ROCM: "1"
+      USE_CUDA: "0"
+      USE_NCCL: "0"
+      USE_SYSTEM_NCCL: "0"
+      USE_RCCL: "1"
+      BUILD_TEST: "0"
+      USE_BENCHMARK: "0"
+      HIP_PATH: "${ROCM_PATH}"
+      ROCM_HOME: "${ROCM_PATH}"
+      CMAKE_PREFIX_PATH: "${ROCM_PATH}"
+      # OpenMP: force clang/amdclang to use LLVM's libomp instead of system libgomp
+      OpenMP_CXX_LIB_NAMES: "omp"
+      OpenMP_omp_LIBRARY: "${ROCM_PATH}/lib/llvm/lib/libomp.so"
+      OpenMP_C_FLAGS: "-fopenmp"
+      OpenMP_CXX_FLAGS: "-fopenmp"
+    build_dependencies:
+      - pip
+      - "numpy>=2.0,<3"
+      - pyyaml
+      - typing_extensions
+      - cmake
+      - ninja
+      - setuptools
+      - wheel
+      - cffi
+      - sympy
+      - filelock
+      - jinja2
+      - networkx
+      - requests
+      - six
+      - fsspec
+    validation:
+      - "python -c 'import torch; assert torch.cuda.is_available(), \"GPU not visible\"'"
+    notes: |
+      ROCm fork carries AMD-specific fixes (hipify, Tensile, rocm_smi
+      linkage) not yet upstreamed. The upstream pytorch/pytorch works with
+      USE_ROCM=1 but AMD's CI tests against this fork.
+
+      USE_ROCM_CK_GEMM=ON enables Composable Kernel GEMM for ROCm.
+    patches:
+      # 1. NumPy 2.0 ABI compatibility
+      - type: sed
+        file: "torch/csrc/utils/numpy_stub.h"
+        marker: "NPY_TARGET_VERSION"
+        marker_absent: true
+        sed_command: >-
+          s|#include <numpy/arrayobject.h>|// Target numpy 2.0 C-API (0x12) for ABI compatibility with numpy >= 2.0.\n#ifndef NPY_TARGET_VERSION\n#define NPY_TARGET_VERSION 0x00000012\n#endif\n\n#include <numpy/arrayobject.h>|
+        description: >
+          Set NPY_TARGET_VERSION to numpy 2.0 C-API (0x12). Without this,
+          numpy 2.x headers compile against oldest compatible API (1.20),
+          producing a .so that crashes at import with numpy 2.x installed.
+
+      # 2. Remove -fclang-abi-compat=17 (ABI mismatch with amdclang 22)
+      - type: sed
+        file: "cmake/Dependencies.cmake"
+        marker: "fclang-abi-compat=17"
+        sed_command: "s/list(APPEND HIP_HIPCC_FLAGS -fclang-abi-compat=17)/# Removed: causes ABI mismatch with host amdclang 22/"
+        description: >
+          Remove -fclang-abi-compat=17 from HIPCC flags. PyTorch adds it
+          for compat with newer hip-clang C++20 mangling rules, but it
+          forces HIP device code to use Clang 17 ABI while host code uses
+          amdclang 22 ABI, causing undefined symbol errors.
+
+      # 3. Add gfx1151 to CK GEMM supported architectures
+      - type: sed
+        file: "aten/src/ATen/Context.cpp"
+        marker: "gfx1151"
+        marker_absent: true
+        sed_command: 's/"gfx90a", "gfx942", "gfx950"/"gfx90a", "gfx942", "gfx950", "gfx1151"/'
+        description: >
+          Add gfx1151 to Composable Kernel GEMM supported architectures.
+          Without this, PyTorch logs "Attempting to use CK on an unsupported
+          architecture!" and TunableOp cannot include CK kernels in its
+          autotuning candidates. The gate is a hardcoded vector of arch strings.
+
+      # 4. OBSOLETE — HIPGraph.hip renamed to HIPGraph.cpp by hipify in
+      # current PyTorch. cudaGraphConditionalHandle removed upstream.
+      # Inline dead code in build-vllm.sh also removed.
+
+      # 5. Wheel RPATH: fix build tree paths in torch/lib/*.so
+      - type: patchelf_rpath
+        target: "torch/lib/lib*.so"
+        condition: "pytorch/build"
+        rpath: "${LOCAL_PREFIX}/lib:${LOCAL_PREFIX}/lib/llvm/lib:\\$ORIGIN"
+        action: set
+        description: >
+          Fix RPATHs inside PyTorch wheel. cmake bakes build tree path
+          (e.g. /opt/src/vllm/pytorch/build/lib) into RUNPATH, causing
+          the dynamic linker to load unpatched .so files from the build
+          tree instead of wheel-relative paths. Adds llvm/lib for libomp.so.
+
+      # 6. Wheel RPATH: add ROCm lib path to .so files that reference ROCm libs
+      - type: patchelf_rpath
+        target: "torch/lib/lib*.so"
+        condition: "NEEDED contains libalm.so, libamdhip64, or librocm_smi"
+        rpath: "${LOCAL_PREFIX}/lib"
+        action: add
+        description: >
+          Add ROCm lib path to .so files that dynamically link ROCm
+          libraries (libalm.so, libamdhip64, librocm_smi64) so they
+          resolve without LD_LIBRARY_PATH at runtime.
+
+      # 7. Wheel RPATH: fix _C extension module build tree path
+      - type: patchelf_rpath
+        target: "torch/_C*.so"
+        condition: "pytorch/build"
+        rpath: "${LOCAL_PREFIX}/lib:${LOCAL_PREFIX}/lib/llvm/lib:\\$ORIGIN/lib"
+        action: set
+        description: >
+          Fix the _C extension module RPATH. Same build tree path issue
+          as torch/lib/*.so but needs $ORIGIN/lib to find sibling .so
+          files in the wheel's lib/ subdirectory.
+
+      # 8. Wheel NEEDED: add librocm_smi64.so to libtorch_hip.so
+      - type: patchelf_needed
+        target: "torch/lib/libtorch_hip.so"
+        library: "librocm_smi64.so"
+        condition: "NEEDED does not contain librocm_smi64"
+        description: >
+          Add librocm_smi64.so to libtorch_hip.so NEEDED list. PyTorch's
+          build system omits it from the link line despite using rsmi_*
+          symbols -- upstream bug that causes "undefined symbol: rsmi_init"
+          at runtime.
+
+      # 9a. OBSOLETE — gloo <cstdint> include added upstream in gloo HEAD
+      # (3135b0b). marker_absent check now always finds marker → skips.
+      # Previously: sed '/#pragma once/a #include <cstdint>' on gloo/types.h
+
+      # 9b. Disable flatbuffers version assertion for compatibility with flatbuffers v25
+      - type: sed
+        file: torch/csrc/jit/serialization/mobile_bytecode_generated.h
+        marker: static_assert(FLATBUFFERS_VERSION_MAJOR == 24
+        sed_command: s/static_assert(FLATBUFFERS_VERSION_MAJOR == 24/static_assert(true
+          || FLATBUFFERS_VERSION_MAJOR == 24/
+        description: Disable flatbuffers version check for compatibility with system
+          flatbuffers (v25)
+      - type: sed
+        file: torch/CMakeLists.txt
+        marker: "csrc/dynamo/cpython_defs.c"
+        marker_absent: true
+        sed_command: /add_library(torch_python SHARED/i set_source_files_properties(${TORCH_SRC_DIR}/csrc/dynamo/cpython_defs.c
+          ${TORCH_SRC_DIR}/csrc/dynamo/eval_frame.c PROPERTIES COMPILE_OPTIONS "-std=c11;-D_GNU_SOURCE")
+        description: Override compile options for Dynamo C files to prevent C++17 flag
+          from causing amdclang errors
+
+      # 10. Fallback for TORCH_CUDA_CPP_API (Template-Level Fix)
+      - type: sed
+        file: aten/src/ATen/cuda/nvrtc_stub/ATenNVRTC.h
+        marker: "ifndef TORCH_CUDA_CPP_API"
+        marker_absent: true
+        sed_command: >-
+          /#include <ATen\/cuda\/ATenCUDAGeneral.h>/a #ifndef TORCH_CUDA_CPP_API
+        description: "Step 1/3: open #ifndef guard in CUDA template for TORCH_CUDA_CPP_API fallback"
+      - type: sed
+        file: aten/src/ATen/cuda/nvrtc_stub/ATenNVRTC.h
+        marker: "define TORCH_CUDA_CPP_API C10_EXPORT"
+        marker_absent: true
+        sed_command: >-
+          /#ifndef TORCH_CUDA_CPP_API/a #define TORCH_CUDA_CPP_API C10_EXPORT
+        description: "Step 2/3: define TORCH_CUDA_CPP_API as C10_EXPORT if missing"
+      - type: sed
+        file: aten/src/ATen/cuda/nvrtc_stub/ATenNVRTC.h
+        marker: "endif // TORCH_CUDA_CPP_API"
+        marker_absent: true
+        sed_command: >-
+          /#define TORCH_CUDA_CPP_API C10_EXPORT/a #endif // TORCH_CUDA_CPP_API
+        description: "Step 3/3: close #ifndef guard in CUDA template"
+
+      # 11. Fix CUDA includes in NVRTC template (Template-Level Fix)
+      - type: sed
+        file: aten/src/ATen/cuda/nvrtc_stub/ATenNVRTC.h
+        marker: "<hip/hiprtc.h>"
+        marker_absent: true
+        sed_command: 's|<cuda\.h>|<hip/hip_runtime_api.h>|g; s|<nvrtc\.h>|<hip/hiprtc.h>|g'
+        description: 'Replace CUDA/NVRTC includes with correct HIP equivalents in the template'
+
+      # 12. OBSOLETE — LegacyThrustHelpers.hip removed upstream. File no longer
+      # exists in PyTorch source tree. sed silently skipped.
+      # Previously: s|#if !CUB_SUPPORTS_SCAN_BY_KEY()|#if 0 // Fixed...|
+
+      # 13. OBSOLETE — SparseSemiSturcturedApply.hip (typo file) removed
+      # upstream. Correctly-spelled SparseSemiStructuredApply.hip exists with
+      # TORCH_CHECK(false) stub — no duplicate symbol risk.
+      # Previously: file_rewrite to empty stub.
+
+      # 14. Fix ValueError when identifying unknown license in build_bundled.py
+      - type: sed
+        file: third_party/build_bundled.py
+        marker: "raise ValueError('unknown license')"
+        sed_command: "s/raise ValueError('unknown license')/return 'Unrecognized'/g"
+        description: >-
+          Prevent wheel packaging failure when an unknown license is encountered
+          (e.g., in opentelemetry-cpp pdcurses port) by returning 'Unrecognized'
+          instead of crashing.
+
+      # 15a. Fix ABI mismatch for CUDABlas gemm/bgemm (Clang 17+ compat)
+      - type: sed
+        file: aten/src/ATen/cuda/CUDABlas.h
+        marker: "typename std::enable_if<!CUDABLAS_GEMM_DTYPE_IS_FLOAT_TYPE_AND_C_DTYPE_IS_FLOAT"
+        sed_command: 's/, typename std::enable_if<.*CUDABLAS_GEMM_DTYPE_IS_FLOAT_TYPE_AND_C_DTYPE_IS_FLOAT.*>::type[[:space:]]*[*][[:space:]]*=[[:space:]]*nullptr//g'
+        description: >-
+          Remove std::enable_if SFINAE from gemm/bgemm templates using greedy
+          matching to handle nested template brackets in the macro.
+
+      # 15b. Identical fix for HIPBlas.h (ROCm counterpart)
+      - type: sed
+        file: aten/src/ATen/hip/HIPBlas.h
+        marker: "typename std::enable_if<!CUDABLAS_GEMM_DTYPE_IS_FLOAT_TYPE_AND_C_DTYPE_IS_FLOAT"
+        sed_command: 's/, typename std::enable_if<.*CUDABLAS_GEMM_DTYPE_IS_FLOAT_TYPE_AND_C_DTYPE_IS_FLOAT.*>::type[[:space:]]*[*][[:space:]]*=[[:space:]]*nullptr//g'
+        description: >-
+          Remove std::enable_if SFINAE from HIPBlas gemm/bgemm templates.
+
+
+  torchvision:
+    repo: "https://github.com/pytorch/vision.git"
+    branch: "v0.24.1"
+    commit: "d801a34632023859a0a274803d6abaf0a45d77a5"
+    src_dir: "torchvision"
+    method: pip
+    phase: C
+    steps: [12, 13]
+    depends_on: [pytorch]
+    compiler: amdclang
+    skip_marker: null
+    skip_check:
+      type: import
+      command: "import torchvision; print(torchvision.__version__)"
+      workdir: "${VLLM_DIR}"
+    environment:
+      TORCH_CUDA_ARCH_LIST: ""
+      FORCE_CUDA: "0"
+      FORCE_MPS: "0"
+    build_dependencies:
+      - "setuptools<81"
+    notes: |
+      Built against source PyTorch (must find torch headers in pytorch/
+      source tree, not from a pip install). setuptools<81 needed because
+      v0.24.1's setup.py imports pkg_resources (removed in setuptools 81+).
+
+  # ---------------------------------------------------------------------------
+  # Phase D: Kernel Compilers
+  # ---------------------------------------------------------------------------
+
+  triton:
+    repo: "https://github.com/ROCm/triton.git"
+    branch: "main_perf"
+    commit: "0ec280cf80dd91e9a86887981a670f2d4541a32b"
+    src_dir: "triton"
+    # Clone flag: ROCm fork validation (ensure remote points to ROCm/triton)
+    validate_remote: "ROCm/triton"
+    method: pip
+    phase: D
+    steps: [14, 15, 16]
+    depends_on: [therock, pytorch]
+    compiler: amdclang
+    skip_marker: null
+    skip_check:
+      type: wheel
+      pattern: "triton*.whl"
+      import_cmd: "import triton; print(triton.__version__)"
+    build_dependencies:
+      - pybind11
+    validation:
+      - "python -c 'import triton; print(triton.__version__)'"
+    notes: |
+      ROCm performance fork of Triton.
+
+      CRITICAL: Does NOT use TheRock's LLVM. TheRock ships LLVM 22 but
+      Triton's codebase expects ~LLVM 19 APIs. Triton downloads and builds
+      its own LLVM internally. Do NOT set LLVM_SYSPATH.
+
+      gfx11 support: warp_size=32 configured in backends/amd/compiler.py.
+
+      target_info and gluon are CUDA-only features -- NOT available in
+      the ROCm fork. This is expected and not a gap.
+
+      Triton compiler bug on gfx1151: the unified attention kernel
+      (triton_unified_attention.py:239) previously produced "operation
+      scheduled before its operands" errors. With Patch 2 below
+      (AttrsDescriptor __repr__) applied, torch.compile with Inductor
+      works correctly on gfx1151 — --enforce-eager is NOT required.
+      Verified with Qwen2.5-7B-Instruct: all AITER optimizations active,
+      correct output across multiple inference tests.
+
+      Inductor codegen bug: AttrsDescriptor in triton/backends/compiler.py
+      has no __repr__ method. torch Inductor codegen uses {triton_meta!r}
+      to serialize kernel metadata into generated Python source files.
+      Without __repr__, Python produces angle-bracket object repr
+      (<triton.backends.compiler.AttrsDescriptor object at 0x...>) which
+      is invalid Python syntax, causing SyntaxError at import time.
+      Fixed by Patch 2 below.
+
+      IMPORTANT: When switching between compilation configurations
+      (e.g., changing custom_ops, enabling/disabling AITER), stale
+      Inductor caches (/tmp/torchinductor_$USER/) and Triton caches
+      (~/.triton/cache/) must be cleared to avoid KeyError crashes
+      from mismatched guard expressions. The vLLM compile cache
+      (~/.cache/vllm/torch_compile_cache/) is config-hash-keyed and
+      does not require manual clearing.
+    patches:
+      # 1. Remove -Werror from CMakeLists.txt
+      - type: sed
+        file: "CMakeLists.txt"
+        marker: " -Werror "
+        sed_command: "s/ -Werror / /"
+        description: >
+          Remove -Werror from Triton's CMakeLists.txt. Our TheRock-built
+          LLVM headers trigger warnings that upstream Triton doesn't see
+          because they use a different LLVM version.
+      # 2. Add __repr__ to AttrsDescriptor (Inductor codegen fix)
+      - type: sed
+        file: "triton/backends/compiler.py"
+        marker: "__repr__"
+        marker_absent: true
+        sed_command: "/def to_dict(self):/i\\    def __repr__(self):\\n        return f'AttrsDescriptor.from_dict({self.to_dict()!r})'"
+        description: >
+          Add __repr__ method to AttrsDescriptor so torch Inductor can
+          serialize it into generated Triton kernel source files as valid
+          Python. Uses the existing to_dict()/from_dict() round-trip.
+          Without this fix, --enforce-eager is required as a workaround
+          which disables CUDAGraph capture and kernel fusion optimizations.
+
+  aotriton:
+    repo: "https://github.com/ROCm/aotriton.git"
+    branch: "main"
+    commit: "e71fc2a64cec741bf11c122ff97f4cca9fc7d0b7"
+    src_dir: "aotriton"
+    method: cmake
+    phase: D
+    steps: [17, 18]
+    depends_on: [triton]
+    compiler: amdclang
+    skip_marker: "lib/libaotriton_v2.so"
+    skip_check:
+      type: file_exists
+      path: "lib/libaotriton_v2.so"
+    notes: |
+      Pre-compiles Triton attention kernels to HSACO (ahead-of-time),
+      eliminating JIT compilation at inference time. v2 with Python
+      bindings. gfx1151 explicitly targeted via AOTRITON_TARGET_ARCH.
+    patches:
+      # 1. Remove stray rebase 'pick' line from CMakeLists.txt
+      - type: sed
+        file: "CMakeLists.txt"
+        marker: "^pick "
+        sed_command: "/^pick /d"
+        description: >
+          Remove stray git rebase 'pick' line from CMakeLists.txt.
+          The AOTriton repo occasionally has rebase artifacts that break
+          cmake parsing.
+
+  # ---------------------------------------------------------------------------
+  # Phase E: vLLM Inference Engine
+  # ---------------------------------------------------------------------------
+
+  vllm:
+    repo: "https://github.com/vllm-project/vllm.git"
+    branch: "v0.24.0"
+    commit: "ee0da84ab9e04ac7610e28580af62c365e898389"
+    src_dir: "vllm"
+    method: pip
+    phase: E
+    steps: [19, 20, 21, 22, 23, 24]
+    depends_on: [pytorch, triton, aotriton]
+    compiler: amdclang
+    skip_marker: null
+    clean_generated: true
+    skip_check:
+      type: import
+      command: "import torch; import vllm; assert torch.cuda.is_available(), 'vLLM/PyTorch ABI Mismatch or GPU init failure'"
+    environment:
+      ROCM_HOME: "${ROCM_PATH}"
+      HIP_PATH: "${ROCM_PATH}"
+    build_dependencies:
+      - pip
+      - numba
+      - scipy
+      - "huggingface-hub[cli,hf_transfer]"
+      - setuptools_scm
+      - "numpy>=2.0,<3"
+      - wheel
+      - packaging
+      - ninja
+    aiter_support: |
+      AITER has FULL gfx1151 support in the AMD fork:
+        - chip_info.py: gfx1151 mapped to enum value 13
+        - fwd_prefill.py: explicit RDNA 3.5 tuning (BLOCK_M=32, BLOCK_N=32,
+          waves_per_eu=2, PRE_LOAD_V=False, 1 stage, 2 warps)
+        - Gluon submodule present at pytorch/third_party/aiter/aiter/ops/triton/gluon/
+
+      HOWEVER: vLLM's _aiter_ops.py gates AITER on on_gfx9() which returns
+      False for gfx1151. rocm_aiter_fa.py gates on on_mi3xx(). Both must
+      be patched to also accept on_gfx1x() for RDNA 3.5 support.
+
+      AITER env vars (all default True when master switch enabled):
+        VLLM_ROCM_USE_AITER=1              (master switch)
+        VLLM_ROCM_USE_AITER_LINEAR=1       (linear layers)
+        VLLM_ROCM_USE_AITER_MOE=1          (mixture of experts)
+        VLLM_ROCM_USE_AITER_RMSNORM=1      (RMSNorm ops)
+        VLLM_ROCM_USE_AITER_MHA=1          (multi-head attention)
+        VLLM_ROCM_USE_AITER_TRITON_GEMM=1  (Triton GEMM kernels)
+    notes: |
+      Upstream vLLM (not ROCm fork). AITER integration comes from
+      PyTorch's third_party/aiter/ which has full gfx1151 support.
+
+      Build attempts AITER first (VLLM_ROCM_USE_AITER=1). If AITER
+      compilation fails, falls back to Triton-only build. Result is
+      recorded in .aiter-status file ("enabled" or "disabled").
+    patches:
+      # Note: amdsmi import order fix is applied inline by patch_amdsmi_import()
+      # in build-vllm.sh (Step 20). The function inserts import amdsmi before
+      # torch in vllm/__init__.py via a Python script that handles docstring
+      # detection. No YAML patch entry needed here.
+
+      # 2. AITER top-level gate: open for gfx1x (replaces broken sed patches)
+      - type: patch
+        path: "${VLLM_DIR}/patches/aiter-gate-gfx1x.patch"
+        description: >
+          Open is_aiter_found_and_supported() for gfx1x (RDNA 3.5).
+          Changes import to on_mi3xx, on_gfx1x and return to
+          on_mi3xx() or on_gfx1x(). Without this, AITER is completely
+          disabled on gfx1151 — all @if_aiter_supported functions
+          return None. Replaces old sed patches that were no-ops
+          (target return on_gfx9() didn't exist in v0.24.0).
+
+      # 3. AITER FA backend: extend rocm_aiter_fa.py for gfx1x
+      - type: patch
+        path: "${VLLM_DIR}/patches/aiter-fa-gfx1x-gate.patch"
+        description: >
+          Extend AiterFlashAttentionBackend.supports_compute_capability()
+          to accept gfx1x. Changes import and return same as patch 2
+          but in rocm_aiter_fa.py. Replaces two broken sed patches
+          that had a marker bug causing triple on_gfx1x imports.
+          ViT FA stays gfx9-only — upstream v0.24.0 already gates
+          on on_gfx9() in rocm.py, no revert needed.
+
+      # 7. FP8 linear: disable AITER CK GEMM on gfx1x
+      - type: file_rewrite
+        file: "vllm/_aiter_ops.py"
+        marker: "# RDNA 3.5 (gfx1x): CK GEMM kernels crash with GPU page faults"
+        marker_absent: true
+        description: >
+          Disable AITER FP8 linear layer (gemm_a8w8_blockscale) on gfx1x.
+          CK GEMM kernels compile successfully via JIT but crash at runtime
+          with "Memory access fault... Page not present" because the
+          underlying Composable Kernel ASM uses CDNA-specific MFMA (Matrix
+          Fused Multiply Add) instructions that do not exist on RDNA 3.5.
+          With this disabled, vLLM falls through to its Triton GEMM
+          blockscale implementation (w8a8_triton_block_scaled_mm_func)
+          which uses pure Triton and works on all architectures.
+        note: "Content is inline Python in build-vllm.sh (multi-line replacement)"
+
+      # 6. Block +rms_norm custom_ops on gfx1x — REMOVED (R.6.5)
+      # is_eager_execution doesn't exist in v0.24.0. CK RMSNorm on gfx1x
+      # is handled by file_rewrite patches 9+10 (Triton dispatch replacement).
+
+      # 7. AITER fusion: skip_duplicates for all register_replacement calls
+      - type: patch
+        path: "${VLLM_DIR}/patches/aiter-fusion-skip-duplicates.patch"
+        description: >
+          Add skip_duplicates=True to all 8 pm.register_replacement()
+          calls in rocm_aiter_fusion.py. Prevents torch pattern_matcher
+          "Duplicate pattern" RuntimeError on non-FP8 architectures like
+          gfx1151. Replaces old sed that only hit 3/8 calls due to
+          premature range termination at self.empty() closing paren.
+
+      # 10. Triton sampler bypass — DISABLED: testing upstream behavior (BUILD-FIXES #41)
+      # The Triton top-k/top-p kernel page-faulted on gfx1151 after torch.compile
+      # AOT compilation. Paudley treats this as historical/version-specific, not
+      # architecture-specific. Disabled to test whether the fault persists with
+      # current Triton/vLLM versions. Re-enable if page fault recurs.
+      # - type: sed
+      #   file: "vllm/v1/sample/ops/topk_topp_sampler.py"
+      #   marker: "NOTE(gfx1151)"
+      #   marker_absent: true
+      #   sed_command: >
+      #     /if HAS_TRITON and logits.shape\[0\] >= 8:/,+2{
+      #       s|    if HAS_TRITON.*|    # NOTE(gfx1151): The Triton top-k/top-p kernel page-faults on RDNA 3.5\n    # after torch.compile AOT compilation. Use the PyTorch sort path instead.\n    # if HAS_TRITON and logits.shape[0] >= 8:\n    #     return apply_top_k_top_p_triton(logits, k, p)|;
+      #       /return apply_top_k_top_p_triton/d
+      #     }
+      #   description: >
+      #     Comment out the Triton top-k/top-p sampler kernel path. On gfx1151,
+      #     the Triton kernel page-faults after torch.compile AOT compilation
+      #     has rewritten the sampling graph. The PyTorch sort-based path
+      #     (apply_top_k_top_p_pytorch) is functionally identical and works
+      #     correctly on all architectures.
+
+      # 9. FLA chunk_delta_h: AMD autotune restrict + exp() float32 cast
+      - type: patch
+        path: "${VLLM_DIR}/patches/fla-chunk-delta-h-gfx1151.patch"
+        description: >
+          Five fixes for chunk_delta_h.py on gfx1151: (1) import is_amd,
+          (2) restrict num_stages to [2] on AMD, (3) restrict BV to [32],
+          (4) cast exp() operands to float32 (Triton HIP type inference
+          bug), (5) cast b_g_last to float32 in second exp() call.
+          Replaces 5 broken sed patches — import pattern didn't match
+          (FLA_CHUNK_SIZE missing) and would have caused NameError.
+
+      # 18. AITER RMSNorm: Triton dispatch for gfx1x (fused_add variant)
+      - type: file_rewrite
+        file: "vllm/_aiter_ops.py"
+        marker: "rmsnorm2d_fwd_with_add_dynamicquant"
+        description: >
+          Replace CK RMSNorm dispatch with gfx1x-aware Triton dispatch in
+          _rocm_aiter_rmsnorm_fused_add_dynamic_quant_impl. The CK RMSNorm
+          (rocm_aiter.rmsnorm2d_fwd_with_add_dynamicquant) accepts a
+          use_model_sensitive_rmsnorm=0 kwarg that the Triton version
+          (aiter.ops.triton.normalization.rmsnorm) does not. On gfx1x, the
+          CK path uses CDNA asm that does not exist on RDNA 3.5.
+        note: >
+          Complex multi-line replacement handled in build-vllm.sh with
+          Python script (too complex for YAML sed expression).
+
+      # 19. AITER RMSNorm: Triton dispatch for gfx1x (plain variant)
+      - type: file_rewrite
+        file: "vllm/_aiter_ops.py"
+        marker: "rmsnorm2d_fwd_with_dynamicquant"
+        description: >
+          Replace CK RMSNorm dispatch with gfx1x-aware Triton dispatch in
+          _rocm_aiter_rmsnorm_fused_dynamic_quant_impl. Same CK->Triton
+          dispatch as patch 18 but for the non-residual variant.
+        note: >
+          Applied together with patch 18 by the same Python script in
+          build-vllm.sh.
+
+      # 11. FLA chunk_o: AMD autotune restrict
+      - type: patch
+        path: "${VLLM_DIR}/patches/fla-chunk-o-gfx1151.patch"
+        description: >
+          Four fixes for chunk_o.py on gfx1151: (1) import is_amd,
+          (2) restrict BK to [32], (3) restrict BV to [32],
+          (4) restrict num_stages to [2]. Same page-fault issues as
+          chunk_delta_h. Replaces 4 broken sed patches — import
+          pattern had FLA_GDN_FIX_BT which was renamed to
+          FLA_CHUNK_SIZE in v0.24.0.
+
+      # 24. config/vllm.py: re-run hybrid alignment after platform config
+      - type: file_rewrite
+        file: "vllm/config/vllm.py"
+        marker: "Re-run hybrid alignment"
+        description: >
+          Re-run HybridAttentionMambaModelConfig.verify_and_update_config()
+          after current_platform.check_and_update_config(). ROCm AITER sets
+          block_size=64 via check_and_update_config(), which clobbers the
+          value computed by HybridAttentionMambaModelConfig (e.g. 576 for
+          Qwen3.5 GDN). The re-run restores the correct block_size that
+          satisfies both attention kernel and mamba state requirements.
+        note: >
+          Complex multi-line insertion handled in build-vllm.sh with
+          Python script (too complex for YAML sed expression).
+
+      # 25. models/config.py: platform block_size as alignment minimum
+      - type: file_rewrite
+        file: "vllm/model_executor/models/config.py"
+        marker: "platform already set a minimum"
+        description: >
+          In HybridAttentionMambaModelConfig.verify_and_update_config(),
+          use max(kernel_block_alignment_size, cache_config.block_size) as
+          the kernel alignment. If the platform already set a minimum
+          block_size (e.g. ROCm AITER requires 64), the computed
+          attn_block_size must be a multiple of that requirement. Without
+          this, the hybrid alignment computes attn_block_size=576 which
+          satisfies mamba state but not the platform's block_size=64
+          alignment.
+        note: >
+          Complex multi-line insertion handled in build-vllm.sh with
+          Python script (too complex for YAML sed expression).
+
+      # 26. rocm.py: skip AITER attention backends for hybrid models [TESTING]
+      - type: file_rewrite
+        file: "vllm/platforms/rocm.py"
+        marker: "_is_hybrid"
+        status: testing
+        description: >
+          Hybrid models (e.g. Qwen3.5 GDN) compute non-power-of-2 block
+          sizes from mamba state alignment (e.g. 576). AITER unified
+          attention and AITER FA use TILE_SIZE = block_size in Triton
+          tl.arange(), which requires power of 2 and must fit in LDS.
+          Skip AITER attention for hybrid models so they fall through to
+          TRITON_ATTN which decouples tile size from block size.
+        note: >
+          Complex multi-line insertion handled in build-vllm.sh with
+          Python script (too complex for YAML sed expression).
+
+      # 27. rocm_aiter_unified_attn.py: power-of-2 block_size check [TESTING]
+      - type: file_rewrite
+        file: "vllm/v1/attention/backends/rocm_aiter_unified_attn.py"
+        marker: "block_size - 1"
+        status: testing
+        description: >
+          Add power-of-2 constraint to supports_block_size(). The original
+          check only validates block_size % 16 == 0, but the AITER Triton
+          unified attention kernel uses TILE_SIZE = block_size in
+          tl.arange(), which requires a power of 2. Hybrid models produce
+          non-power-of-2 block sizes (e.g. 576); this check correctly
+          rejects them so the backend falls through to TritonAttentionBackend.
+        note: >
+          Complex multi-line replacement handled in build-vllm.sh with
+          Python script (too complex for YAML sed expression).
+
+      # 28. Fix build-system dependency: remove strict torch version pin
+      - type: sed
+        file: "pyproject.toml"
+        marker: 'torch == 2.11.0'
+        sed_command: 's/"torch == 2.11.0"/"torch >= 2.11.0"/'
+        description: >-
+          Relax strict torch version requirement in build-system. Prevents pip
+          from downloading torch 2.11.0 from PyPI when a custom source-built
+          torch >= 2.11.0 is already installed in the venv.
+
+      # 29. Enable native ROCm PagedAttention for gfx1151 (Strix Halo)
+      - type: sed
+        file: "vllm/platforms/rocm.py"
+        marker: 'if _ON_GFX9 or ("gfx1151" in _GCN_ARCH):'
+        marker_absent: true
+        sed_command: '/use_rocm_custom_paged_attention/,/if _ON_GFX9:/ s/if _ON_GFX9:/if _ON_GFX9 or ("gfx1151" in _GCN_ARCH):/'
+        description: >-
+          Unlock native ROCm PagedAttention C++ kernels for gfx1151 within the
+          specific scope of the selection function. Context-aware sed prevents
+          unintended activation of unstable FlashAttention/ViT paths.
+
+      # 16. Unlock CPU weight offloading in V1 engine — REMOVED (R.6.8)
+      # The offload assertion (assert self.offload_config.uva.cpu_offload_gb == 0)
+      # doesn't exist in v0.24.0. Upstream removed or refactored the restriction.
+
+      # 31. Qwen3VL ViT: import set_default_torch_dtype for FP32 init
+      - type: sed
+        file: "vllm/model_executor/models/qwen3_vl.py"
+        marker: "from vllm.utils.torch_utils import set_default_torch_dtype"
+        marker_absent: true
+        sed_command: '/from vllm.utils.collection_utils import is_list_of/a\from vllm.utils.torch_utils import set_default_torch_dtype'
+        description: >-
+          Add set_default_torch_dtype import needed by patch #32.
+          The Qwen3VL ViT encoder produces 100% NaN in last_hidden_state
+          on gfx1151/ROCm when running in BF16 or FP16 due to SDPA/GELU
+          overflow. FP32 computation in the visual tower fixes this.
+
+      # 32. Qwen3VL ViT: force FP32 init to fix NaN on gfx1151 (ROCm)
+      # Too complex for inline sed (multi-line indent change). Applied in
+      # patch_vllm_gfx1151() via Python script.
+      # See build-vllm.sh for the implementation.
+
+      # 33. EngineCore idle busy-loop: progressive backoff (BUILD-FIXES #96)
+      - type: patch
+        path: "${VLLM_DIR}/patches/enginecore-idle-backoff.patch"
+        description: >
+          Replace fixed 1ms conditional sleep with progressive backoff
+          (0ms -> 1ms -> 10ms -> 100ms -> 500ms) to eliminate 100% CPU spin
+          when EngineCore is idle. Reset immediately on activity.
+          Applied idempotently via git apply --reverse --check.
+
+      # 33b. ROCm HSA BusyWaitSignal spin: hipDeviceScheduleBlockingSync (BUILD-FIXES #101)
+      - type: patch
+        path: "${VLLM_DIR}/patches/env-override-hip-blocking-sync.patch"
+        description: >
+          Add hipSetDeviceFlags(hipDeviceScheduleBlockingSync) to
+          vllm/env_override.py before torch import. On ROCm RDNA iGPUs,
+          the default hipDeviceScheduleSpin creates a persistent HSA
+          BusyWaitSignal thread per GPU context consuming 100% of one
+          CPU core even when idle. BlockingSync uses interrupt-based
+          waits, reducing idle CPU from ~1 core to ~0 per instance.
+          Tested: HSA_ENABLE_SDMA=0 worsens; other HSA vars no effect.
+
+      # 34. AITER FP4: on_gfx950() not imported (BUILD-FIXES #97)
+      - type: patch
+        path: "${VLLM_DIR}/patches/aiter-fp4-import-fix.patch"
+        description: >
+          Fix NameError in is_fp4bmm_enabled() and
+          is_asm_fp4_gemm_dynamic_quant_enabled(). Both methods import
+          on_gfx9 but call on_gfx950(), which is not in scope. Replace
+          with on_gfx9() which is functionally equivalent for FP4
+          (returns True only on CDNA3/4 GPUs where FP4 is supported).
+
+      # 35. FP8 E5M2 C++ types for KV cache on RDNA 3+ (BUILD-FIXES #92, #93)
+      - type: patch
+        path: "${VLLM_DIR}/patches/fp8-e5m2-quant-utils.patch"
+        description: >
+          Add E5M2 type aliases, conversion functions
+          (vec_conversion_e5m2, scaled_vec_conversion_e5m2), and
+          DISPATCH_BY_KV_CACHE_DTYPE branches for fp8_e5m2 in
+          amd/quant_utils.cuh. RDNA 3+ hardware only supports E5M2
+          natively — E4M3 causes Triton JIT failures. Requires C++
+          extension rebuild after patching.
+
+      # 36. Skip torch.distributed for single-GPU (BUILD-FIXES #102)
+      - type: patch
+        path: "${VLLM_DIR}/patches/skip-distributed-single-gpu.patch"
+        description: >
+          SingleGPUGroup class in parallel_state.py — drop-in replacement
+          for GroupCoordinator when world_size=1. All collective operations
+          are identity no-ops. Early returns in init_distributed_environment()
+          and initialize_model_parallel() skip init_process_group and
+          new_group() entirely. Guard in gpu_worker.py skips distributed
+          init for single-GPU. Guard in uniproc_executor.py skips
+          dist.all_reduce when cpu_group is None. Eliminates ~13 epoll
+          threads per EngineCore, reducing idle CPU from ~3% to ~0% and
+          saving ~2 W per instance.
+
+      # 37. spinloop.cpp: include x86intrin.h instead of mwaitxintrin.h (BUILD-FIXES #134)
+      - type: patch
+        path: "${VLLM_DIR}/patches/spinloop-x86intrin.patch"
+        description: >
+          Clang 23 (TheRock LLVM) adds an #error guard to mwaitxintrin.h
+          that forbids direct inclusion — requires x86intrin.h umbrella
+          header instead. vLLM's csrc/spinloop.cpp includes mwaitxintrin.h
+          directly for _mm_monitorx/_mm_mwaitx intrinsics. Single-line fix:
+          mwaitxintrin.h → x86intrin.h. No functional change — x86intrin.h
+          includes mwaitxintrin.h internally.
+
+      # 38. Triton chained or→parentheses (BUILD-FIXES #135)
+      - type: patch
+        path: "${VLLM_DIR}/patches/triton-or-chain-fix.patch"
+        description: >
+          Triton main_perf (0ec280cf) rejects chained boolean operators
+          (A or B or C) without parentheses. vLLM v0.24.0's penalties
+          Triton kernel uses a 3-way or chain. Fix: add parentheses
+          (A or B) or C. Single-line change, no functional difference.
+
+      # 39. Triton knobs module guard (BUILD-FIXES #136)
+      - type: patch
+        path: "${VLLM_DIR}/patches/triton-knobs-import-fix.patch"
+        description: >
+          Triton main_perf (0ec280cf) lacks the triton.knobs module that
+          upstream Triton added later. vLLM v0.24.0's jit_monitor.py imports
+          knobs unconditionally for autotuning print and JIT hooks. Wrap both
+          imports in try/except ImportError to gracefully degrade when knobs
+          is unavailable.
+
+      # 40. Enable FP8 platform flag for gfx1x (RDNA 3.5)
+      - type: patch
+        path: "${VLLM_DIR}/patches/fp8-support-gfx1x.patch"
+        description: >
+          Extend supports_fp8() in rocm.py to include on_gfx1x(). Currently
+          only on_gfx9() or on_gfx12x() return True, blocking all FP8 paths
+          on gfx1151. FP8 KV-Cache (E5M2) already works via patch #35;
+          this flag unblocks FP8 weight quantization (W8A8) at the platform
+          level. Note: is_linear_fp8_enabled() (patch #7) still returns
+          False on gfx1x — CK GEMM crashes on RDNA. Only platform-level
+          FP8 support is enabled; per-feature gates remain independent.
+
+      # 41. Triton make_tensor_descriptor stub (BUILD-FIXES #159)
+      - type: patch
+        path: "${VLLM_DIR}/patches/triton-attn-td-stub.patch"
+        description: >
+          Triton 3.0.0 (main_perf @ 0ec280cf) lacks tl.make_tensor_descriptor
+          (added in Triton 3.3+). vLLM's triton_unified_attention.py calls
+          tl.make_tensor_descriptor directly in @triton.jit helper functions
+          (_load_q_td, _load_kv_tile_td, _store_output_td). These are XPU-only
+          (USE_TD=False on CUDA/ROCm), but Triton's JIT AST visitor parses all
+          nodes before constexpr pruning, triggering AttributeError even on
+          dead-code branches. FLA ops (fla/ops/op.py) already have a local
+          stub fallback (upstream PR #37088/#38981), but unified_attention was
+          not patched. Fix: resolve make_tensor_descriptor at module level with
+          fallback stub, mirroring the FLA ops pattern. Replaces 3 call sites.
+          No runtime impact — stub returns None, USE_TD=False on ROCm, branch
+          never executed.
+
+      # 42. Triton chained or→parentheses in attention helpers (BUILD-FIXES #162)
+      - type: patch
+        path: "${VLLM_DIR}/patches/triton-attn-chained-bool.patch"
+        description: >
+          Triton main_perf (0ec280cf) rejects chained boolean operators
+          (A or B or C) without parentheses. vLLM's triton_attention_helpers.py
+          compute_tile_loop_bounds() uses a 3-way or chain in an if-statement.
+          When TRITON_ATTN backend is selected (e.g. for int8_per_token_head
+          KV-cache), the @triton.jit helper is inlined into the attention kernel
+          and Triton's AST-to-TTIR compiler raises UnsupportedLanguageConstruct.
+          Fix: add parentheses A or (B or C). Same root cause as patch #38
+          (penalties.py), different source file. Single-line change, no
+          functional difference.
+
+  # ---------------------------------------------------------------------------
+  # Phase F: Attention
+  # ---------------------------------------------------------------------------
+
+  flash_attention:
+    repo: "https://github.com/ROCm/flash-attention.git"
+    branch: "main_perf"
+    commit: "3f94643fb41bcedded28c85185a8e11d42ef1592"
+    src_dir: "flash-attention"
+    method: pip
+    phase: F
+    steps: [25, 26, 27, 28]
+    depends_on: [pytorch, triton, vllm]
+    compiler: amdclang
+    skip_marker: null
+    skip_check:
+      type: import
+      command: "import flash_attn; print(flash_attn.__version__)"
+    build_dependencies:
+      - einops
+      - packaging
+    notes: |
+      ROCm fork with explicit gfx1151 tuning in
+      flash_attn_triton_amd/fwd_prefill.py:
+        - RDNA arch config: BLOCK_M=32, BLOCK_N=32, waves_per_eu=2,
+          PRE_LOAD_V=False, num_stages=1, num_warps=2
+        - gfx1151 listed explicitly alongside gfx1100, gfx1150, gfx1200
+
+      Pure Python wheel -- kernels are JIT-compiled at runtime via Triton.
+      FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE must be set.
+    patches:
+      # Note: amdsmi import order fix is applied inline by patch_flash_amdsmi()
+      # in build-vllm.sh (Step 27). No YAML prepend entry needed here.
+
+      # 2. Skip internal AITER install (we build AITER separately in step 28b)
+      - type: file_rewrite
+        file: "setup.py"
+        marker: "# PATCHED: skip aiter install"
+        marker_absent: true
+        description: >
+          Flash Attention's setup.py runs pip install third_party/aiter which
+          bundles pre-compiled gfx942 code objects that fail on gfx1151. Since
+          we build AITER separately from PyTorch's submodule (step 28b) with
+          gfx1151 patches, skip the flash_attn internal install.
+        note: "Content is inline Python in build-vllm.sh (replaces aiter install block)"
+
+  aiter:
+    repo: "https://github.com/ROCm/aiter.git"
+    branch: "v0.1.16.post3"
+    commit: "27fdb590cf85855395936ac57e4069d33e77eb2f"
+    # Note: Fetched as PyTorch submodule (pytorch/third_party/aiter)
+    src_dir: "pytorch/third_party/aiter"
+    method: pip
+    phase: F
+    steps: [28]
+    depends_on: [pytorch, vllm]
+    compiler: amdclang
+    skip_marker: null
+    skip_check:
+      type: import
+      command: "from aiter._version import __version__; print(__version__)"
+    environment:
+      PREBUILD_KERNELS: "0"
+    # Modules that use CDNA-only ISA and cannot compile on RDNA 3.5 (gfx1151).
+    # Skipped during JIT pre-warm to avoid wasting hours on guaranteed failures.
+    # vLLM has Triton/PyTorch fallback paths for all of these.
+    jit_skip_modules:
+      - module_activation         # v_pk_mul_f32 (CDNA packed FP32 multiply)
+      - module_quick_all_reduce   # CDNA collective ops
+      - module_moe_asm            # s_bitcmp1_b32 (CDNA scalar bit compare)
+      - module_mha_bwd            # missing asm_fmha_v3_bwd_configs.hpp (backward codegen targets gfx9xx only)
+      - module_mha_varlen_bwd     # same missing backward configs header
+      - module_mha_batch_prefill  # buffer_load_dword...lds (CDNA async LDS DMA)
+      - libmha_fwd                # buffer_load_dword...lds (CDNA async LDS DMA)
+      - libmha_bwd                # backward + async LDS
+      - module_topk_plain         # static_assert(size >= 2 * get_warp_size()) assumes wave64
+      - module_cache              # CDNA-specific cache ops
+      - module_deepgemm           # CDNA MFMA instructions
+      - module_gemm_a8w8_bpreshuffle_cktile  # CDNA block-scaled GEMM
+      # CDNA-only FP4/gfx950-Module (...)
+      - module_rmsnorm
+      - module_mha_fwd
+      - module_mha_varlen_fwd
+      - module_gemm_fp4
+      - module_moe_fp4
+      - module_linear_fp4
+      - module_mxfp4
+      - module_mixed_prec_flatmm
+      - module_groupnorm
+    aiter_support: |
+      AITER's Python layer fully recognizes gfx1151 (chip_info.py enum 13,
+      _aiter_ops.py on_gfx1x() check). However the CUDA/HIP kernel sources
+      contain CDNA-only (gfx9) assembly instructions that fail to JIT compile
+      on RDNA 3.5. These patches add RDNA fallback code paths matching the
+      approach used by rocprim's own warp_reduce_dpp.hpp.
+    notes: |
+      Rebuilt from PyTorch's third_party/aiter/ submodule to align CK ABI
+      with the CK headers used by AITER's JIT at runtime.
+
+      PREBUILD_KERNELS=0: skip 45-minute full kernel precompilation.
+      Kernels are JIT-compiled on first use instead.
+
+      After wheel install, two header patches are applied to the installed
+      aiter_meta/csrc/include/ files for gfx1151 RDNA 3.5 compatibility.
+    patches:
+      # 1. vec_convert.h: RDNA 3 scalar fallbacks for CDNA packed FP8 instructions
+      - type: file_rewrite
+        file: "aiter_meta/csrc/include/ck_tile/vec_convert.h"
+        marker: "CK_TILE_RDNA3_NO_PK_FP8"
+        marker_absent: true
+        description: >
+          Add RDNA 3/3.5 scalar C++ fallbacks for three CDNA-only packed
+          instructions: v_pk_mul_f32 (packed FP32 multiply, gfx940+),
+          v_cvt_pk_fp8_f32 (packed FP8 conversion, gfx942+), and
+          v_cvt_pk_bf8_f32 (packed BF8 conversion, gfx942+). On gfx11xx,
+          these are replaced with scalar multiply/clamp+convert operations
+          guarded by CK_TILE_RDNA3_NO_PK_FP8. Applied to installed
+          site-packages, not source tree (JIT reads installed headers).
+        note: "Content is a heredoc in build-vllm.sh (multi-line C++ with preprocessor guards)"
+
+      # 2. hip_reduce.h: RDNA 3 ds_swizzle fallbacks for DPP row broadcasts
+      - type: file_rewrite
+        file: "aiter_meta/csrc/include/hip_reduce.h"
+        marker: "AITER_RDNA_NO_DPP_BCAST"
+        marker_absent: true
+        description: >
+          Replace DPP row_bcast:15 (0x142) and row_bcast:31 (0x143) with
+          ds_swizzle (warp_swizzle<T, 0x1e0>) on RDNA 3/3.5. DPP broadcast
+          instructions are CDNA-only (gfx9); RDNA uses the ds_swizzle
+          equivalent that maps lane_id & 15 — functionally identical after
+          intra-row reduction makes all lanes in a row hold the same value.
+          This is the same fix rocprim applies in warp_reduce_dpp.hpp when
+          ROCPRIM_HAS_PERMLANE() is true. Also guards the thread_num==64
+          path in multithread_reduce with #if !defined(AITER_RDNA_NO_DPP_BCAST)
+          since RDNA wave size is 32, not 64.
+        note: "Content is a heredoc in build-vllm.sh (multi-line C++ with preprocessor guards)"
+
+      # 3. unified_attention.py: TILE_SIZE cap for hybrid models [TESTING]
+      - type: sed
+        file: "aiter/ops/triton/attention/unified_attention.py"
+        marker: "min(block_size, 128)"
+        marker_absent: true
+        status: testing
+        sed_command: "s/TILE_SIZE = block_size/TILE_SIZE = min(block_size, 128)/"
+        description: >
+          Cap TILE_SIZE to min(block_size, 128) in both select_2d_config
+          (decode branch) and select_3d_config. Defense-in-depth for hybrid
+          models with large non-power-of-2 block_size (e.g. 576). Without
+          the cap, TILE_SIZE=576 would require 576 * head_size * elem_size
+          bytes of shared memory per K/V tile, blowing the 64 KiB LDS on
+          all AMD GPUs. For standard block_size (64/128) this is a no-op.
+        note: >
+          Primary protection comes from vLLM patches 26-27 which route hybrid
+          models away from AITER attention entirely. This cap is
+          defense-in-depth for any code path that reaches the AITER kernel
+          with a non-standard block_size.
+
+      # 4. Fix constexpr warpSize for RDNA 3.5 (gfx1151)
+      - type: sed
+        file: aiter_meta/csrc/include/ck_tile/core/arch/arch.hpp
+        marker: 'return 32; // Patched for gfx1151'
+        marker_absent: true
+        sed_command: 's/return warpSize;/return 32; \/\/ Patched for gfx1151/'
+        description: >-
+          Fix constexpr warpSize for RDNA 3.5: warpSize is a runtime variable in
+          ROCm >= 5.x, illegal in C++20 constexpr context. gfx1151 wavefront size
+          is always 32. Patches installed JIT header, consistent with vec_convert
+          and hipreduce patches.
+
+  # ---------------------------------------------------------------------------
+  # Phase G: Build Validation + AITER JIT Pre-warm (no patches)
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # Phase H: Optimized Wheels
+  # ---------------------------------------------------------------------------
+
+  rust_wheels:
+    method: cargo
+    phase: H
+    steps: [30]
+    depends_on: [cpython]
+    notes: |
+      Builds and installs orjson and cryptography from source with Rust flags:
+        RUSTFLAGS="-C target-cpu=znver5 -C opt-level=3"
+      This enables full AVX-512 + VAES codegen for Zen 5.
+
+      Do NOT add -C lto=thin here -- maturin adds -C embed-bitcode=no
+      which conflicts with -C lto. Maturin manages its own LTO.
+
+      Rust's linker invokes `cc` which resolves to the amdclang symlink,
+      but AMD's wrapper rejects binaries not prefixed with "amd". Fix:
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=amdclang
+
+      Must unset CFLAGS/CXXFLAGS/LDFLAGS during Rust builds because
+      they contain clang-specific flags (-famd-opt, -mllvm) that rustc's
+      internal cc invocations for build scripts don't understand.
+
+  native_wheels:
+    method: pip
+    phase: H
+    steps: [31]
+    depends_on: [cpython, pytorch]
+    notes: |
+      Builds and installs numpy, sentencepiece, zstandard, asyncpg from
+      source with Zen 5 optimization flags.
+
+      numpy: cmake pip wrapper breaks in build isolation; replaced with
+      symlink to system cmake.
+
+      meson-based packages (numpy, zstandard): -mllvm flags must be
+      rewritten as -Xclang -mllvm -Xclang pairs because meson's compiler
+      probing rejects -mllvm as "unused command line argument".
+      -famd-opt moved to LDFLAGS (link-time-only driver flag, no-op at
+      compile time -- triggers -Werror=unused in compile-only probes).
+    patches:
+      # 1. Fix broken cmake pip wrapper in venv
+      - type: file_copy
+        src: "system cmake binary"
+        dst: "${VLLM_DIR}/.venv/bin/cmake"
+        description: >
+          Replace broken Python cmake wrapper with symlink to real system
+          cmake. The cmake pip package installs a Python wrapper that does
+          `from cmake import cmake`, which fails inside pip's build
+          isolation where the cmake Python module isn't available.
+
+  source_wheels:
+    method: export
+    phase: H
+    steps: [32]
+    depends_on: [pytorch, triton, torchvision, vllm]
+    notes: |
+      Packages torch, triton, torchvision, amd-aiter, amdsmi as
+      distributable .whl files for installation in other venvs
+      (project worktrees, development environments).
+
+      amd-aiter: JIT-compiles kernels at runtime; wheel is optional.
+      If build fails, it's non-fatal.
+
+  # ---------------------------------------------------------------------------
+  # Phase I: Lemonade Inference Server
+  # ---------------------------------------------------------------------------
+
+  llamacpp:
+    repo: "https://github.com/ggml-org/llama.cpp.git"
+    branch: "master"
+    commit: "a4107133a634250c8c9d888bc0bc8520dcfd6105"
+    src_dir: "llama.cpp"
+    shallow: false
+    clean_generated: true
+    method: cmake
+    phase: I
+    steps: [33]
+    depends_on: [therock]
+    compiler: amdclang
+    skip_marker: null
+    skip_check:
+      type: file_exists
+      path: "llama.cpp/build-rocm/llama-server"
+      paths:
+        - "llama.cpp/build-vulkan/llama-server"
+        - "llama.cpp/build-cpu/llama-server"
+    backends:
+      rocm:
+        install_dir: "${LLAMACPP_SRC}/build-rocm"
+        build_dir: "build-rocm"
+        cmake_flags:
+          GGML_HIP: "ON"
+          AMDGPU_TARGETS: "gfx1151"
+        hip_flags: "--offload-arch=gfx1151 -mllvm -amdgpu-function-calls=false -mllvm -amdgpu-early-inline-all=true -famd-opt"
+        env:
+          HSA_OVERRIDE_GFX_VERSION: "11.5.1"
+          ROCBLAS_USE_HIPBLASLT: "1"
+          THP: "always"
+          LLAMA_ARG_BATCH: "2048"
+          LLAMA_ARG_UBATCH: "2048"
+      vulkan:
+        install_dir: "${LLAMACPP_SRC}/build-vulkan"
+        build_dir: "build-vulkan"
+        cmake_flags:
+          GGML_VULKAN: "ON"
+        env:
+          LLAMA_ARG_BATCH: "2048"
+          LLAMA_ARG_UBATCH: "2048"
+      cpu:
+        install_dir: "${LLAMACPP_SRC}/build-cpu"
+        build_dir: "build-cpu"
+        env:
+          OMP_NUM_THREADS: "{{ nproc }}"
+          GGML_CPU_BACKEND: "zen4"
+    binaries:
+      - llama-server
+      - llama-bench
+      - llama-cli
+      - llama-quantize
+    notes: |
+      llama.cpp built with THREE backends for Lemonade:
+
+      ROCm (hipBLAS): Primary backend. Best prefill <32K context. Uses
+      amdclang from TheRock with full Zen 5 + gfx1151 HIP optimization
+      flags. Binaries placed where Lemonade SDK expects them.
+
+      Vulkan: Secondary backend. +22% generation speed (44 vs 39 tok/s)
+      and handles >32K context prefill (no VMM limitation on gfx1151).
+      CPU-only optimization flags, no HIP offload.
+
+      CPU-only: Fallback backend for embedding models and CPU inference.
+      Same amdclang + Polly optimizations as ROCm/Vulkan host code.
+      libomp.so copied for amdclang transitive dependency resolution.
+
+      All three backends share: GGML_BACKEND_DL=ON, GGML_CPU_ALL_VARIANTS=ON,
+      BUILD_SHARED_LIBS=ON, cmake-zen4-only patch (x64 + zen4 variants only),
+      grammar-max-rep-threshold patch. RPATH patched via patchelf.
+
+    patches:
+      # 1. Reduce CPU backend variants from 14 to 2 (x64 + zen4) for all
+      # backends. Zen 5 uses zen4 ISA extensions; runtime loader picks best
+      # .so via CPUID. Requires GGML_CPU_ALL_VARIANTS=ON + GGML_BACKEND_DL=ON.
+      - type: patch
+        path: "${VLLM_DIR}/patches/cmake-zen4-only.patch"
+        description: >-
+          Build only x64 baseline and zen4 CPU variants for all backends.
+           Reduces build time and binary size. Requires GGML_CPU_ALL_VARIANTS=ON.
+           Runtime loader selects best .so via CPUID.
+
+      # 3. Cherry-pick PR #21003: Increase MAX_REPETITION_THRESHOLD from 2000
+      # to 50000 and make configurable via LLAMA_GRAMMAR_MAX_REPS envvar.
+      # Fixes grammar parse errors with complex tool-calling grammars (OpenClaw).
+      - type: patch
+        path: "${VLLM_DIR}/patches/grammar-max-rep-threshold.patch"
+        description: >-
+          Cherry-pick PR #21003: increase grammar repetition threshold from
+          2000 to 50000 default, configurable via LLAMA_GRAMMAR_MAX_REPS envvar.
+          Fixes parse errors with large tool-calling grammars (e.g. OpenClaw).
+
+      # 4. Hybrid/Recurrent Checkpoint & Cache Restore Fix (BUILD-FIXES #164).
+      # Backports mike07026's engine-layer fixes (commits 5418233, e05ffb0,
+      # 51de10c, 65e06f8, f9c9a19) for Gated DeltaNet models (Qwen3.6, etc.).
+      # Fixes: forced full prompt re-processing (#22746), crashes at n_parallel>1
+      # (#20176, #23322), checkpoint invalidation (#24055).
+      # 8 patch files — adapted to our base (SRV_TRC logging, message_spans API).
+
+      # 4a. Public C API: recurrent expand/shrink + clear_checkpoint.
+      - type: patch
+        path: "${VLLM_DIR}/patches/hybrid-attn-llama-api.patch"
+        description: >-
+          C API in include/llama.h: llama_memory_recurrent_expand/shrink,
+          llama_context_recurrent_expand/shrink, and
+          llama_context_recurrent_clear_checkpoint.
+
+      # 4b. Context-level: resize_recurrent_memory + clear_recurrent_checkpoint.
+      - type: patch
+        path: "${VLLM_DIR}/patches/hybrid-attn-llama-context.patch"
+        description: >-
+          llama_context::resize_recurrent_memory() and clear_recurrent_checkpoint()
+          in llama-context.cpp + llama-context.h. dynamic_cast chain to find
+          recurrent component (recurrent → hybrid → hybrid_iswa).
+
+      # 4c. Core recurrent memory: expand/shrink/resize + cell_zero + checkpoint.
+      - type: patch
+        path: "${VLLM_DIR}/patches/hybrid-attn-memory-recurrent.patch"
+        description: >-
+          llama-memory-recurrent.cpp + .h: expand/shrink/resize with
+          checkpoint save/restore, cell_zero (full field clearing + R/S tensor
+          zeroing), cell_zero_snapshots, cell_copy_primary_to_snapshots,
+          seq_rm tail invalidation, seq_cp rs_idx assert, state_read snapshot
+          copy, s_copy size_t cast, find_slot fresh-cell snapshot zeroing.
+
+      # 4d. Hybrid memory: seq_rm fallback + seq_pos_min + PARTIAL_ONLY.
+      - type: patch
+        path: "${VLLM_DIR}/patches/hybrid-attn-memory-hybrid.patch"
+        description: >-
+          llama-memory-hybrid.cpp: seq_rm falls back to cell_zero on recurrent
+          failure instead of returning false. seq_pos_min returns attention-only
+          (not max of attn+recr). PARTIAL_ONLY already upstream for hybrid.
+
+      # 4e. Hybrid ISWA memory: same fixes as 4d.
+      - type: patch
+        path: "${VLLM_DIR}/patches/hybrid-attn-memory-hybrid-iswa.patch"
+        description: >-
+          llama-memory-hybrid-iswa.cpp: seq_rm fallback, seq_pos_min fix,
+          state_write/read with PARTIAL_ONLY flag (skip attention when set).
+
+      # 4f. Graph builder: zero ALL snapshot planes in build_rs.
+      - type: patch
+        path: "${VLLM_DIR}/patches/hybrid-attn-llama-graph.patch"
+        description: >-
+          llama-graph.cpp: build_rs() now zeros all snapshot planes of rs_zero
+          cell (primary + snapshots), not just the primary row. Prevents
+          cross-sequence state leakage via s_copy with rs_idx > 0.
+
+      # 4g. MTP speculative: zero pending_h at conversation start.
+      - type: patch
+        path: "${VLLM_DIR}/patches/hybrid-attn-speculative.patch"
+        description: >-
+          speculative.cpp: zero pending_h carry-over vector at begin() of MTP
+          draft. Prevents stale embedding from previous conversation leaking
+          into the first process() call of a new conversation.
+
+      # 4h. Server integration: shrink/expand, checkpoint restore, anchor-tracking.
+      - type: patch
+        path: "${VLLM_DIR}/patches/hybrid-attn-server.patch"
+        description: >-
+          server-context.cpp: recurrent shrink/expand around prompt cache,
+          clear_checkpoint after cache load, checkpoint restore path for
+          n_swa==0 hybrid models, checkpoint pruning by n_past_prefix,
+          anchor-tracking checkpoint strategy, PARTIAL_ONLY for draft state,
+          send_error null-safe, prompt.checkpoints.clear().
+
+      # 4i. Server task: draft prompt-cache load flags fix.
+      - type: patch
+        path: "${VLLM_DIR}/patches/hybrid-attn-server-task.patch"
+        description: >-
+          server-task.cpp: fix draft prompt-cache load to use
+          PARTIAL_ONLY flag matching prompt_save, preventing
+          state serialization layout mismatch for hybrid draft models.
+
+      # 4j. GDN shift-register for MTP bounded rollback snapshots.
+      - type: patch
+        path: "${VLLM_DIR}/patches/mtp-shift-register.patch"
+        description: >-
+          delta-net-base.cpp: shift snapshot slots right before writing
+          slot_0 during single-token decode, so slot_k holds the state
+          from k steps ago. Fixes stale snapshot data in build_recurrent_attn
+          and build_conv_state when n_rs_seq > 0.
+
+      # 4k. MTP premature EOS prevention — sampling API.
+      - type: patch
+        path: "${VLLM_DIR}/patches/mtp-eos-sampling.patch"
+        description: >-
+          sampling.cpp: add common_sampler_sample_and_accept_n_prob which
+          runs verification on a throwaway sampler clone, preventing RNG
+          and penalty state mutation during rejected draft verification.
+
+      # 4l. MTP premature EOS prevention — sampling header.
+      - type: patch
+        path: "${VLLM_DIR}/patches/mtp-eos-sampling-h.patch"
+        description: >-
+          sampling.h: declaration for common_sampler_sample_and_accept_n_prob.
+
+      # 4m. MTP premature EOS prevention — speculative header.
+      - type: patch
+        path: "${VLLM_DIR}/patches/mtp-eos-speculative-h.patch"
+        description: >-
+          speculative.h: add draft_probs field to draft params and
+          vector include for speculative state serialization.
+
+  lemonade:
+    repo: "https://github.com/lemonade-sdk/lemonade.git"
+    branch: "v10.9.0"
+    commit: "af311e1ac19e974ce0f0ea0bec27be195adc69e7"
+    src_dir: "lemonade"
+    shallow: false
+    method: cmake
+    phase: I
+    steps: [34]
+    depends_on: [therock]
+    compiler: system
+    skip_marker: null
+    patches:
+      - type: sed
+        file: "src/cpp/resources/backend_versions.json"
+        marker: '"vulkan": "b9747"'
+        description: "Disable llamacpp version check — custom builds don't match bundled releases"
+        sed_command: '/"llamacpp"/,/}/ s/"vulkan": "[^"]*"/"vulkan": ""/; /"llamacpp"/,/}/ s/"rocm-stable": "[^"]*"/"rocm-stable": ""/; /"llamacpp"/,/}/ s/"rocm-nightly": "[^"]*"/"rocm-nightly": ""/; /"llamacpp"/,/}/ s/"cpu": "[^"]*"/"cpu": ""/'
+    notes: |
+      Lemonade inference server built from source (CMake + Ninja) on branch
+      v10.9.0 at pinned commit. Produces lemond (daemon) + lemonade (CLI)
+      + web app (React, BUILD_WEB_APP=ON, Node.js required).
+
+      AUR package (lemonade-server) kept installed for systemd unit template,
+      tmpfiles.d, sysusers.d, and man pages. Systemd override points
+      ExecStart to our custom build.
+
+      No Python SDK installed — C++ server handles model downloads,
+      .env loading, and hardware detection natively since v10.
+
+      backend_versions.json patched: llamacpp vulkan/rocm/cpu versions set
+      to empty string so the backend manager skips version checks for our
+      custom-built llama.cpp backends (avoids "update required" UI locks).
+      Metal left untouched as we don't use it.
+    validation:
+      - "test -x ${LEMONADE_SRC}/build/lemond"
+      - "test -x ${LEMONADE_SRC}/build/lemonade"
