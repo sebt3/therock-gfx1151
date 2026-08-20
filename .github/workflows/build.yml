@@ -94,6 +94,17 @@ jobs:
       working-directory: /opt/therock
       run: python3 build_tools/fetch_sources.py --stage math-libs
 
+    # compiler/hipify isn't in the math-libs stage's own submodule set, but
+    # the super-project's CMakeLists.txt unconditionally add_subdirectory()s
+    # it - cmake needs its CMakeLists.txt on disk even though bootstrap
+    # marks it prebuilt and it never actually gets compiled. It's bundled
+    # in the same source_set as amd-llvm (huge) in BUILD_TOPOLOGY.toml, so
+    # fetch just this one submodule directly instead of pulling that whole
+    # set in via fetch_sources.py.
+    - name: Fetch hipify submodule (needed for configure, not built)
+      working-directory: /opt/therock
+      run: git submodule update --init --depth 1 compiler/hipify
+
     # Our 3 build-process fixes, retriaged this session against the
     # therock-7.14 tag (see repo history). #2/#3 are no-ops for this scoped
     # config (media-libs/testing both off) but harmless to keep applied.
