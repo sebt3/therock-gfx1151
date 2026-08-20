@@ -14,21 +14,29 @@ own *build process*, not any library's actual behavior, so a vanilla
 official build is functionally identical to ours for everything except the
 one stage we actually have a reason to touch.
 
-So this repo builds **only the math-libs stage** (rocBLAS, hipBLASLt,
-rocSPARSE, hipSPARSE, rocSOLVER, hipSOLVER, hipBLAS, rocFFT, hipFFT,
-rocPRIM, hipCUB, rocThrust, MIOpen...) from source, and gets everything
-upstream of it (the compiler, HIP runtime, core libs) from AMD's own
-official CI build of the exact `therock-7.14` tag commit
-(`ROCm/TheRock` run `29052575219`, public S3 bucket
-`therock-ci-artifacts`, anonymous access — verified directly, not assumed).
+So this repo builds **math-libs proper** (rocBLAS, hipBLASLt, rocSPARSE,
+hipSPARSE, rocSOLVER, hipSOLVER, hipBLAS, rocFFT, hipFFT, rocPRIM, hipCUB,
+rocThrust) from source, and gets everything upstream of it (the compiler,
+HIP runtime, core libs) from AMD's own official CI build of the exact
+`therock-7.14` tag commit (`ROCm/TheRock` run `29052575219`, public S3
+bucket `therock-ci-artifacts`, anonymous access — verified directly, not
+assumed).
+
+**MIOpen excluded** (`THEROCK_ENABLE_MIOPEN=OFF`): TheRock's own
+`BUILD_TOPOLOGY.toml` bundles it into the same "math-libs" *stage* as
+rocBLAS et al, but its kernel compilation is by far the slowest thing
+TheRock builds from source and blew through a 90-minute CI budget on its
+own. vLLM's actual need is GEMM (rocBLAS/hipBLASLt), not MIOpen's
+conv-focused kernels, so this isn't a real loss for this repo's purpose.
 
 TheRock's own `buildctl.py bootstrap --stage math-libs` mechanism makes
 this work: it drops `.prebuilt` marker files for every artifact math-libs
 needs as an inbound dependency, which cmake respects *if bootstrapped
 before the first configure* (order matters — doing it after does not
 retroactively skip already-materialized build steps). Validated locally on
-real hardware before wiring into CI: the whole math-libs stage built in
-~25 real minutes with zero compiler-runtime rebuild.
+real hardware before wiring into CI: rocBLAS+dist (representative of the
+non-MIOpen portion) built in ~25 real minutes with zero compiler-runtime
+rebuild.
 
 Split across repos by what actually needs to move together:
 

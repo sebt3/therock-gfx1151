@@ -23,13 +23,17 @@ jobs:
   build:
     runs-on: ubuntu-latest
     # Validated locally on real hardware (bootstrap-before-configure, same
-    # recipe as below): the full math-libs+ml-libs stage (rocBLAS,
-    # hipBLASLt, rocSPARSE, hipSPARSE, rocSOLVER, hipSOLVER, hipBLAS,
-    # rocFFT, hipFFT, rocPRIM, hipCUB, rocThrust, MIOpen...) built in ~25
-    # real minutes with zero LLVM/core-runtime rebuild, using AMD's own
-    # official artifacts (baseline run above) for everything upstream of
-    # math-libs. 90 minutes leaves generous margin.
-    timeout-minutes: 90
+    # recipe as below): rocBLAS+dist (representative of math-libs proper -
+    # rocBLAS, hipBLASLt, rocSPARSE, hipSPARSE, rocSOLVER, hipSOLVER,
+    # hipBLAS, rocFFT, hipFFT, rocPRIM, hipCUB, rocThrust) built in ~25 real
+    # minutes with zero LLVM/core-runtime rebuild, using AMD's own official
+    # artifacts (baseline run above) for everything upstream of math-libs.
+    # First CI attempt at the *full* math-libs+ml-libs stage (i.e. with
+    # MIOpen also in scope) hit this 90min timeout - MIOpen's kernel
+    # compilation is the slow part, now excluded (THEROCK_ENABLE_MIOPEN=OFF
+    # below). 100 minutes leaves margin over the internal 80m build timeout
+    # for the other steps.
+    timeout-minutes: 100
     steps:
     - uses: actions/checkout@v4
       with:
@@ -144,6 +148,14 @@ jobs:
           --stage math-libs \
           --target-families gfx1151
 
+    # THEROCK_ENABLE_MIOPEN=OFF: the math-libs *stage* (BUILD_TOPOLOGY.toml)
+    # bundles ml-libs (MIOpen) in with math-libs proper, but MIOpen's kernel
+    # compilation is by far the most time-consuming thing TheRock builds
+    # from source - the first attempt at this build hit the 90min timeout
+    # (99% almost certainly stuck in MIOpen, not the actually-fast rocBLAS/
+    # hipBLASLt/etc that finished in ~25min in local testing). vLLM's own
+    # need is GEMM (rocBLAS/hipBLASLt), not MIOpen's conv-focused kernels -
+    # dropping it narrows this repo's actual scope to what's needed.
     - name: Configure
       working-directory: /opt/therock
       run: |
@@ -151,17 +163,41 @@ jobs:
           -DTHEROCK_AMDGPU_FAMILIES=gfx1151 \
           -DTHEROCK_BUILD_TESTING=OFF \
           -DTHEROCK_ENABLE_MEDIA_LIBS=OFF \
-          -DTHEROCK_ENABLE_PROFILER=OFF
+          -DTHEROCK_ENABLE_PROFILER=OFF \
+          -DTHEROCK_ENABLE_MIOPEN=OFF
+
+    # Resumable in case one run still isn't enough: same rationale as
+    # stack-torch-gfx1151's cache step (restore-keys picks up the most
+    # recent previous run's ninja state by prefix).
+    - name: Cache build tree
+      uses: actions/cache@v4
+      with:
+        path: /opt/therock/build
+        key: therock-mathlibs-build-${{ hashFiles('patches-repo/patches/*.patch') }}-${{ github.run_id }}
+        restore-keys: |
+          therock-mathlibs-build-${{ hashFiles('patches-repo/patches/*.patch') }}-
 
     - name: Build math-libs (compiler-runtime skipped via bootstrap)
       working-directory: /opt/therock
-      run: cmake --build build --target therock-artifacts therock-dist -- -j4
+      run: timeout 80m cmake --build build --target therock-artifacts therock-dist -- -j4 || true
+
+    - name: Check build completed
+      id: check
+      run: |
+        if [ -f /opt/therock/build/artifacts/blas_lib_gfx1151/artifact_manifest.txt ]; then
+          echo "done=true" >> $GITHUB_OUTPUT
+        else
+          echo "done=false" >> $GITHUB_OUTPUT
+          echo "::warning::Build did not finish in this run; re-run the workflow to resume from cache."
+        fi
 
     - name: Package
+      if: steps.check.outputs.done == 'true'
       run: |
         tar czf therock-gfx1151-mathlibs-${{ steps.version.outputs.tag }}.tar.gz -C /opt/therock/build/artifacts .
 
     - name: Publish release
+      if: steps.check.outputs.done == 'true'
       uses: softprops/action-gh-release@v2
       with:
         tag_name: ${{ steps.version.outputs.tag }}
