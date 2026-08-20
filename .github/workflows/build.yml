@@ -23,17 +23,16 @@ jobs:
   build:
     runs-on: ubuntu-latest
     # Validated locally on real hardware (bootstrap-before-configure, same
-    # recipe as below): rocBLAS+dist (representative of math-libs proper -
-    # rocBLAS, hipBLASLt, rocSPARSE, hipSPARSE, rocSOLVER, hipSOLVER,
-    # hipBLAS, rocFFT, hipFFT, rocPRIM, hipCUB, rocThrust) built in ~25 real
-    # minutes with zero LLVM/core-runtime rebuild, using AMD's own official
-    # artifacts (baseline run above) for everything upstream of math-libs.
-    # First CI attempt at the *full* math-libs+ml-libs stage (i.e. with
-    # MIOpen also in scope) hit this 90min timeout - MIOpen's kernel
-    # compilation is the slow part, now excluded (THEROCK_ENABLE_MIOPEN=OFF
-    # below). 100 minutes leaves margin over the internal 80m build timeout
-    # for the other steps.
-    timeout-minutes: 100
+    # recipe as below): rocBLAS+dist alone built in ~25 real minutes with
+    # zero LLVM/core-runtime rebuild. But the full math-libs set (rocBLAS,
+    # hipBLASLt, rocSPARSE, hipSPARSE, rocSOLVER, hipSOLVER, hipBLAS,
+    # rocFFT, hipFFT, rocPRIM, hipCUB, rocThrust) is much bigger than that
+    # one library - hipBLASLt alone (tensilelite GEMM kernel codegen) is
+    # taking multiple 80-minute runs. Bumped the budget to cut down on
+    # resume cycles, each of which pays ~10-15min of fixed overhead
+    # (clone/fetch/configure) before any real build time - same GH-hosted
+    # hard cap (360m) and resumable-cache pattern as stack-torch-gfx1151.
+    timeout-minutes: 350
     steps:
     - uses: actions/checkout@v4
       with:
@@ -200,7 +199,7 @@ jobs:
 
     - name: Build math-libs (compiler-runtime skipped via bootstrap)
       working-directory: /opt/therock
-      run: timeout 80m cmake --build build --target therock-artifacts therock-dist -- -j4 || true
+      run: timeout 330m cmake --build build --target therock-artifacts therock-dist -- -j4 || true
 
     - name: Check build completed
       id: check
