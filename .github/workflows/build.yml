@@ -113,6 +113,7 @@ jobs:
         mkdir -p /opt/raw-artifacts
         python3 build_tools/fetch_artifacts.py \
           --run-id "${THEROCK_BASELINE_RUN_ID}" \
+          --run-github-repo ROCm/TheRock \
           --amdgpu-targets gfx1151 \
           --no-extract \
           --output-dir /opt/raw-artifacts
