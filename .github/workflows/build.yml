@@ -62,7 +62,7 @@ jobs:
           bison flex xxd scons meson \
           libvulkan-dev mesa-vulkan-drivers python3-dev python3-pip python3-venv \
           build-essential lsb-release procps \
-          libgl1-mesa-dev libglx-dev libopengl-dev libsqlite3-dev
+          libgl1-mesa-dev libglx-dev libopengl-dev libsqlite3-dev libdrm-dev
 
     - name: Install Clang 21 (TheRock requires >= 21)
       run: |
@@ -156,6 +156,15 @@ jobs:
     # hipBLASLt/etc that finished in ~25min in local testing). vLLM's own
     # need is GEMM (rocBLAS/hipBLASLt), not MIOpen's conv-focused kernels -
     # dropping it narrows this repo's actual scope to what's needed.
+    # The rest of these mirror what stack-torch-gfx1151's vendored
+    # build-vllm.sh disables for its own (fuller) TheRock configure -
+    # `therock-artifacts`/`therock-dist` build *everything enabled*, not
+    # just math-libs's own inbound deps, so anything not explicitly turned
+    # off here still gets attempted even though bootstrap has nothing
+    # prebuilt for it. Found this the hard way: rocjitsu (under the
+    # unconditional add_subdirectory(emulation) in the root CMakeLists.txt)
+    # ran for 34 minutes before failing on a missing libdrm/drm.h header -
+    # not something math-libs needs at all.
     - name: Configure
       working-directory: /opt/therock
       run: |
@@ -164,7 +173,19 @@ jobs:
           -DTHEROCK_BUILD_TESTING=OFF \
           -DTHEROCK_ENABLE_MEDIA_LIBS=OFF \
           -DTHEROCK_ENABLE_PROFILER=OFF \
-          -DTHEROCK_ENABLE_MIOPEN=OFF
+          -DTHEROCK_ENABLE_MIOPEN=OFF \
+          -DTHEROCK_ENABLE_DEBUG_TOOLS=OFF \
+          -DTHEROCK_ENABLE_DC_TOOLS=OFF \
+          -DTHEROCK_ENABLE_EMULATION=OFF \
+          -DTHEROCK_ENABLE_HIPDNN_INTEGRATION_TESTS=OFF \
+          -DTHEROCK_ENABLE_HIPDNN_SAMPLES=OFF \
+          -DTHEROCK_ENABLE_CORE_RUNTIME_TESTS=OFF \
+          -DTHEROCK_ENABLE_HOST_MATH=OFF \
+          -DTHEROCK_ENABLE_ROCALUTION=OFF \
+          -DTHEROCK_ENABLE_ROCWMMA=OFF \
+          -DTHEROCK_ENABLE_HIPTENSOR=OFF \
+          -DTHEROCK_ENABLE_ROCSHMEM=OFF \
+          -DTHEROCK_ENABLE_HOTSWAP=OFF
 
     # Resumable in case one run still isn't enough: same rationale as
     # stack-torch-gfx1151's cache step (restore-keys picks up the most
