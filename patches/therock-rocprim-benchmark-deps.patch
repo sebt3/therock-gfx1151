@@ -1,8 +1,11 @@
 <!-- Copyright 2026 bitserv-ai -->
-diff --git a/cmake/therock_primlibs_benchmark_deps.cmake b/cmake/therock_primlibs_benchmark_deps.cmake
+<!-- Retargeted 2026-08-20 for therock-7.14: upstream renamed
+     cmake/therock_primlibs_benchmark_deps.cmake -> cmake/therock_rocprim_benchmark_deps.cmake
+     (commit history between 7.13 and 7.14). Content/issue unchanged. -->
+diff --git a/cmake/therock_rocprim_benchmark_deps.cmake b/cmake/therock_rocprim_benchmark_deps.cmake
 index 925fc0faa..7275854fe 100644
---- a/cmake/therock_primlibs_benchmark_deps.cmake
-+++ b/cmake/therock_primlibs_benchmark_deps.cmake
+--- a/cmake/therock_rocprim_benchmark_deps.cmake
++++ b/cmake/therock_rocprim_benchmark_deps.cmake
 @@ -11,6 +11,15 @@
  # TODO(https://github.com/ROCm/TheRock/issues/4651): Remove once upstream
  # rocPRIM adds its own find_package(amd_smi).

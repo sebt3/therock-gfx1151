@@ -1,4 +1,4 @@
-name: Build TheRock
+name: Build TheRock (math-libs, custom-patched)
 
 on:
   push:
@@ -8,16 +8,32 @@ on:
 permissions:
   contents: write
 
+env:
+  THEROCK_TAG: therock-7.14
+  # ROCm/TheRock's own official CI run that built the therock-7.14 tag
+  # commit (418cd5f) for linux/gfx1151. Found via
+  # build_tools/find_artifacts_for_commit.py --commit 418cd5f... --workflow
+  # multi_arch_ci.yml --artifact-group gfx115X-all. Overall run conclusion
+  # was "failure" (an unrelated job failed) but the gfx1151 artifacts
+  # uploaded fine - verified directly against the public S3 bucket
+  # (therock-ci-artifacts, anonymous access) before relying on this.
+  THEROCK_BASELINE_RUN_ID: "29052575219"
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    # GitHub-hosted runner hard cap is 6h; TheRock's own estimate is
-    # "2-4h on 16 cores" and this runner has far fewer cores. actions/cache
-    # on the build tree lets a re-triggered run resume ninja's progress
-    # instead of restarting cold if this timeout is hit.
-    timeout-minutes: 360
+    # Validated locally on real hardware (bootstrap-before-configure, same
+    # recipe as below): the full math-libs+ml-libs stage (rocBLAS,
+    # hipBLASLt, rocSPARSE, hipSPARSE, rocSOLVER, hipSOLVER, hipBLAS,
+    # rocFFT, hipFFT, rocPRIM, hipCUB, rocThrust, MIOpen...) built in ~25
+    # real minutes with zero LLVM/core-runtime rebuild, using AMD's own
+    # official artifacts (baseline run above) for everything upstream of
+    # math-libs. 90 minutes leaves generous margin.
+    timeout-minutes: 90
     steps:
     - uses: actions/checkout@v4
+      with:
+        path: patches-repo
 
     - name: Free up runner disk space
       uses: jlumbroso/free-disk-space@main
@@ -31,7 +47,7 @@ jobs:
 
     - name: Get version
       id: version
-      run: echo "tag=$(cat .tags)" >> $GITHUB_OUTPUT
+      run: echo "tag=$(cat patches-repo/.tags)" >> $GITHUB_OUTPUT
 
     - name: Install build prerequisites
       run: |
@@ -55,56 +71,86 @@ jobs:
         sudo update-alternatives --set clang++ /usr/bin/clang++-21
         sudo update-alternatives --set lld /usr/bin/lld-21
 
-    - name: Install lit (LLVM Integrated Tester)
-      run: pip3 install --break-system-packages --no-cache-dir lit
-
-    - name: Prepare VLLM_DIR
+    # Full clone (not sparse): cmake needs to see the whole superproject
+    # tree to build the DAG, even though --stage math-libs below skips
+    # fetching the heavy submodules (amd-llvm etc) we don't need content
+    # for. --depth 1 since we only need the tag commit, not history.
+    - name: Clone TheRock at ${{ env.THEROCK_TAG }}
       run: |
-        sudo mkdir -p /opt/src/vllm
-        sudo chown "$(id -u):$(id -g)" /opt/src/vllm
+        git clone --depth 1 --branch "${THEROCK_TAG}" https://github.com/ROCm/TheRock.git /opt/therock
 
-    # Unique key per run so the cache save always happens (actions/cache
-    # refuses to overwrite an existing key); restore-keys picks up the
-    # most recent previous run's progress by prefix. Ninja's own state
-    # (.ninja_log, build.ninja, stamps) then makes the resumed run skip
-    # everything already completed instead of restarting cold.
-    - name: Cache build tree
-      uses: actions/cache@v4
-      with:
-        path: /opt/src/vllm
-        key: therock-build-${{ hashFiles('vllm-packages.yaml', 'patches/*.patch') }}-${{ github.run_id }}
-        restore-keys: |
-          therock-build-${{ hashFiles('vllm-packages.yaml', 'patches/*.patch') }}-
+    # Covers lit, pyzstd, boto3, joblib, msgpack, zstandard, PyYAML,
+    # CppHeaderParser and everything else fetch_sources.py/buildctl.py/
+    # fetch_artifacts.py need - found each of these missing one at a time
+    # in local testing before switching to just installing the real list.
+    - name: Install TheRock's own Python build deps
+      run: pip3 install --break-system-packages --no-cache-dir -r /opt/therock/requirements.txt
 
-    # Leaves ~15min margin under the 6h job cap for the cache-save
-    # post-step to run. `|| true` means a timeout doesn't fail the step -
-    # completion is checked explicitly below via the therock-built marker,
-    # so a partial run still saves its cache and exits the job cleanly
-    # instead of getting killed and skipping the cache-save post-step
-    # (which is what happened when this ran with no timeout wrapper: the
-    # job hit an external shutdown signal and cache save was skipped
-    # entirely, losing 1h30 of progress).
-    - name: Build TheRock
-      run: timeout 345m ./build-vllm.sh || true
+    # Scoped to the math-libs stage's own submodules (rocm-libraries,
+    # rocm-systems, libhipcxx) via BUILD_TOPOLOGY.toml - skips amd-llvm
+    # (2.5G) and everything else not needed here. Also applies TheRock's
+    # own internal per-subproject patches (patches/amd-mainline/...).
+    - name: Fetch math-libs stage sources
+      working-directory: /opt/therock
+      run: python3 build_tools/fetch_sources.py --stage math-libs
 
-    - name: Check build completed
-      id: check
+    # Our 3 build-process fixes, retriaged this session against the
+    # therock-7.14 tag (see repo history). #2/#3 are no-ops for this scoped
+    # config (media-libs/testing both off) but harmless to keep applied.
+    - name: Apply local patches
+      working-directory: /opt/therock
       run: |
-        if [ -x /opt/src/vllm/local/bin/hipcc ]; then
-          echo "done=true" >> $GITHUB_OUTPUT
-        else
-          echo "done=false" >> $GITHUB_OUTPUT
-          echo "::warning::TheRock build did not finish in this run; re-run the workflow to resume from cache."
-        fi
+        for p in "${GITHUB_WORKSPACE}"/patches-repo/patches/therock-*.patch; do
+          echo "Applying $p"
+          git apply --verbose "$p"
+        done
+
+    # Raw (unextracted) archives - buildctl.py bootstrap below filters
+    # these down to just what math-libs needs as inbound deps.
+    - name: Fetch official artifact archives
+      working-directory: /opt/therock
+      run: |
+        mkdir -p /opt/raw-artifacts
+        python3 build_tools/fetch_artifacts.py \
+          --run-id "${THEROCK_BASELINE_RUN_ID}" \
+          --amdgpu-targets gfx1151 \
+          --no-extract \
+          --output-dir /opt/raw-artifacts
+
+    # MUST run before the first cmake configure: buildctl.py writes
+    # "stage.prebuilt" marker files that cmake only respects when it
+    # discovers them during the subproject's *initial* configure. Doing
+    # this after a first configure does not retroactively skip the
+    # already-materialized build steps (found the hard way locally: had
+    # to redo the test with a fresh build dir).
+    - name: Bootstrap math-libs stage from official artifacts
+      working-directory: /opt/therock
+      run: |
+        python3 build_tools/buildctl.py bootstrap \
+          --build-dir build \
+          --artifact-dir /opt/raw-artifacts \
+          --stage math-libs \
+          --target-families gfx1151
+
+    - name: Configure
+      working-directory: /opt/therock
+      run: |
+        cmake -S . -B build -GNinja \
+          -DTHEROCK_AMDGPU_FAMILIES=gfx1151 \
+          -DTHEROCK_BUILD_TESTING=OFF \
+          -DTHEROCK_ENABLE_MEDIA_LIBS=OFF \
+          -DTHEROCK_ENABLE_PROFILER=OFF
+
+    - name: Build math-libs (compiler-runtime skipped via bootstrap)
+      working-directory: /opt/therock
+      run: cmake --build build --target therock-artifacts therock-dist -- -j4
 
     - name: Package
-      if: steps.check.outputs.done == 'true'
       run: |
-        tar czf therock-gfx1151-${{ steps.version.outputs.tag }}.tar.gz -C /opt/src/vllm/local .
+        tar czf therock-gfx1151-mathlibs-${{ steps.version.outputs.tag }}.tar.gz -C /opt/therock/build/artifacts .
 
     - name: Publish release
-      if: steps.check.outputs.done == 'true'
       uses: softprops/action-gh-release@v2
       with:
         tag_name: ${{ steps.version.outputs.tag }}
-        files: therock-gfx1151-${{ steps.version.outputs.tag }}.tar.gz
+        files: therock-gfx1151-mathlibs-${{ steps.version.outputs.tag }}.tar.gz
