@@ -164,6 +164,30 @@ jobs:
     # unconditional add_subdirectory(emulation) in the root CMakeLists.txt)
     # ran for 34 minutes before failing on a missing libdrm/drm.h header -
     # not something math-libs needs at all.
+    #
+    # Positioned *before* the cache-restore step, deliberately: TheRock's
+    # per-library toggles (ROCWMMA, ROCALUTION, HIPTENSOR, MIOPEN, HIPDNN...)
+    # are declared via therock_add_feature() as CACHE BOOL entries with no
+    # FORCE, so command-line -D flags always win *on the invocation that
+    # sets them* - but if Cache restores an older build/CMakeCache.txt
+    # *after* this step (as it did originally), that stale cache silently
+    # overwrites ours, reverting every one of these flags to ON. Confirmed
+    # directly in a resumed run's configure log: ROCWMMA, ROCALUTION,
+    # HIPTENSOR, HIPDNN, HIPDNN_SAMPLES, CORE_RUNTIME_TESTS all showed
+    # "Enabled" despite being passed OFF here, and MIOPEN=OFF was getting
+    # force-re-enabled via THEROCK_ENABLE_ML_LIBS's REQUIRES chain (never
+    # explicitly disabled below, only the individual MIOPEN feature was) -
+    # explaining why every resume cycle kept silently rebuilding the full
+    # ml-libs/profiler/debug-tools set for hours instead of the narrow
+    # BLAS/RAND/FFT/PRIM/SPARSE/SOLVER scope this repo targets.
+    - name: Cache build tree
+      uses: actions/cache@v4
+      with:
+        path: /opt/therock/build
+        key: therock-mathlibs-build-${{ hashFiles('patches-repo/patches/*.patch') }}-${{ github.run_id }}
+        restore-keys: |
+          therock-mathlibs-build-${{ hashFiles('patches-repo/patches/*.patch') }}-
+
     - name: Configure
       working-directory: /opt/therock
       run: |
@@ -172,6 +196,7 @@ jobs:
           -DTHEROCK_BUILD_TESTING=OFF \
           -DTHEROCK_ENABLE_MEDIA_LIBS=OFF \
           -DTHEROCK_ENABLE_PROFILER=OFF \
+          -DTHEROCK_ENABLE_ML_LIBS=OFF \
           -DTHEROCK_ENABLE_MIOPEN=OFF \
           -DTHEROCK_ENABLE_DEBUG_TOOLS=OFF \
           -DTHEROCK_ENABLE_DC_TOOLS=OFF \
@@ -179,23 +204,18 @@ jobs:
           -DTHEROCK_ENABLE_HIPDNN_INTEGRATION_TESTS=OFF \
           -DTHEROCK_ENABLE_HIPDNN_SAMPLES=OFF \
           -DTHEROCK_ENABLE_CORE_RUNTIME_TESTS=OFF \
+          -DTHEROCK_ENABLE_CORE_HIPTESTS=OFF \
           -DTHEROCK_ENABLE_HOST_MATH=OFF \
           -DTHEROCK_ENABLE_ROCALUTION=OFF \
           -DTHEROCK_ENABLE_ROCWMMA=OFF \
           -DTHEROCK_ENABLE_HIPTENSOR=OFF \
           -DTHEROCK_ENABLE_ROCSHMEM=OFF \
+          -DTHEROCK_ENABLE_ROCJITSU=OFF \
+          -DTHEROCK_ENABLE_ROCGDB=OFF \
+          -DTHEROCK_ENABLE_ROCR_DEBUG_AGENT=OFF \
+          -DTHEROCK_ENABLE_RDC=OFF \
+          -DTHEROCK_ENABLE_AMD_DBGAPI=OFF \
           -DTHEROCK_ENABLE_HOTSWAP=OFF
-
-    # Resumable in case one run still isn't enough: same rationale as
-    # stack-torch-gfx1151's cache step (restore-keys picks up the most
-    # recent previous run's ninja state by prefix).
-    - name: Cache build tree
-      uses: actions/cache@v4
-      with:
-        path: /opt/therock/build
-        key: therock-mathlibs-build-${{ hashFiles('patches-repo/patches/*.patch') }}-${{ github.run_id }}
-        restore-keys: |
-          therock-mathlibs-build-${{ hashFiles('patches-repo/patches/*.patch') }}-
 
     - name: Build math-libs (compiler-runtime skipped via bootstrap)
       working-directory: /opt/therock
