@@ -68,26 +68,33 @@ Split across repos by what actually needs to move together:
   Renamed from `therock-primlibs-benchmark-deps` to match upstream's own
   file rename between `a512f42` and `therock-7.14`. No-op for this repo's
   config (`THEROCK_BUILD_TESTING=OFF`), kept applied for parity.
-- `therock-mesondeps-reconfigure-dedup` — the meson-based sysdeps that
+- `therock-sysdeps-drop-versionscript` — the meson-based sysdeps that
   inject a `-Wl,--version-script=...` via the `LDFLAGS` env var
   (libpciaccess, libdrm) hit `ld: duplicate version tag` in CI on a genuine
-  from-scratch build. Root cause: meson's own compiler sanity check (run
-  once per `setup`, including on `--reconfigure`) duplicates env-derived
-  link args onto its generated sanity-check command line — visible directly
-  in the log (`-Wl,--version-script=... -Wl,--version-script=...`, and
-  every other env-derived flag, appearing twice on that one line). Harmless
-  for most flags, but `ld` rejects the same version-script tag applied
-  twice. (First attempted fix — wiping meson's state dirs on the theory
-  that TheRock's own double cmake-reconfigure per job was accumulating the
-  flag across two separate `meson setup` invocations — reproduced the
-  identical failure, ruling that mechanism out.) Actual fix: pass the flag
-  via meson's `-Dc_link_args=` built-in option instead of the `LDFLAGS` env
-  var — it goes through meson's normal single-application path, sidestepping
-  the sanity-check duplication entirely. amd-mesa has the same
-  LDFLAGS-based pattern but is unreachable here
-  (`THEROCK_ENABLE_MEDIA_LIBS=OFF`); util-linux uses a different mechanism
-  (patches `.sym` files directly rather than an env var) and isn't
-  affected.
+  from-scratch build. Root cause: meson 1.12.0's own compiler sanity check
+  (run once per `setup`, including on `--reconfigure`) applies the flag to
+  its generated sanity-check command line *twice* — visible directly in the
+  log (`-Wl,--version-script=... -Wl,--version-script=...`). Two mechanism
+  changes were tried and both reproduced the identical failure, ruling them
+  out as the cause: wiping meson's state dirs (theory: TheRock's double
+  cmake-reconfigure per job was accumulating the flag across two separate
+  `meson setup` invocations) and passing the flag via meson's
+  `-Dc_link_args=` built-in option instead of `LDFLAGS` (theory: the
+  duplication was env-var-specific). Neither changed anything, confirming
+  the duplication happens inside meson's own sanity-check construction
+  regardless of how the flag reaches it. Actual fix: drop the
+  `--version-script` application entirely for these two libraries (rpath
+  stays, via `-Dc_link_args=`, since `ld` tolerates repeated `-rpath`
+  entries — only `--version-script` has the uniqueness requirement that
+  makes the duplication fatal). This loses the symbol-versioning that
+  protects against a clash if a distro-installed libpciaccess/libdrm is
+  *also* loaded into the same process as this bundled copy — not this
+  repo's deployment target (a narrow, internally-consumed math-libs
+  artifact), so accepting the loss is a reasonable trade for an actually
+  buildable stage. amd-mesa has the same LDFLAGS-based pattern but is
+  unreachable here (`THEROCK_ENABLE_MEDIA_LIBS=OFF`); util-linux uses a
+  different mechanism (patches `.sym` files directly rather than an env
+  var) and isn't affected.
 
 Dropped: a `roctx64`/`roctracer.h` super-project-resolution fix that lived
 inline in the old `vllm-packages.yaml` (not upstream gfx115x — authored

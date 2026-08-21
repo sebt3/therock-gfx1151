@@ -1,0 +1,74 @@
+diff --git a/third-party/sysdeps/linux/libdrm/CMakeLists.txt b/third-party/sysdeps/linux/libdrm/CMakeLists.txt
+index 9e3b96e..8af2f3e 100644
+--- a/third-party/sysdeps/linux/libdrm/CMakeLists.txt
++++ b/third-party/sysdeps/linux/libdrm/CMakeLists.txt
+@@ -81,8 +81,6 @@ add_custom_target(
+   COMMAND
+     "${CMAKE_COMMAND}" -E chdir "${PATCH_SOURCE_DIR}"
+     "${CMAKE_COMMAND}" -E env
+-      # Escaping hack: experimentally determined to persist through the layers.
+-      "LDFLAGS=-Wl,-rpath='$$ORIGIN' -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/version.lds"
+       "CC=${_meson_cc}"
+       "CXX=${_meson_cxx}"
+       --
+@@ -100,6 +98,25 @@ add_custom_target(
+         -Dnouveau=disabled
+         -Dradeon=disabled
+         -Dvmwgfx=disabled
++        # rpath only (was LDFLAGS env var alongside --version-script;
++        # escaping hack experimentally determined to persist through the
++        # layers). version.lds symbol versioning (AMDROCM_SYSDEPS_1.0)
++        # intentionally dropped: whether supplied via LDFLAGS or
++        # -Dc_link_args=, meson's own compiler sanity check (run once per
++        # `setup`, including on `--reconfigure`) applies the
++        # -Wl,--version-script=... flag to its generated sanity-check
++        # command line *twice* - reproduced identically both ways in CI -
++        # and ld rejects the duplicate tag. -rpath doesn't hit this (ld
++        # tolerates repeated -rpath entries), so it stays as a meson
++        # built-in option; version-script does not, so it's gone. The
++        # versioning exists to avoid symbol clashes if a distro-installed
++        # libdrm is ALSO loaded into the same process as this bundled copy;
++        # for this repo's narrow, internally-consumed math-libs artifact
++        # that coexistence scenario isn't the deployment target, so
++        # accepting the loss is a reasonable trade for an actually
++        # buildable stage. See libpciaccess/CMakeLists.txt for the same
++        # trade-off, hit and analyzed there first.
++        "-Dc_link_args=-Wl,-rpath='$$ORIGIN'"
+   COMMAND
+     "${MESON_BUILD}" compile --verbose
+   COMMAND
+diff --git a/third-party/sysdeps/linux/libpciaccess/CMakeLists.txt b/third-party/sysdeps/linux/libpciaccess/CMakeLists.txt
+index 78e8a29..9540bf2 100644
+--- a/third-party/sysdeps/linux/libpciaccess/CMakeLists.txt
++++ b/third-party/sysdeps/linux/libpciaccess/CMakeLists.txt
+@@ -80,8 +80,6 @@ add_custom_target(
+     # Run meson from the source directory to avoid this issue.
+     "${CMAKE_COMMAND}" -E chdir "${SOURCE_DIR}"
+     "${CMAKE_COMMAND}" -E env
+-      # Apply symbol versioning via version.lds. RPATH is set post-install via patch_install.py.
+-      "LDFLAGS=-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/version.lds"
+       "CC=${_meson_cc}"
+       "CXX=${_meson_cxx}"
+       --
+@@ -93,6 +91,21 @@ add_custom_target(
+         -Dpkgconfig.relocatable=true
+         -Dlibdir=lib
+         -Dzlib=disabled
++        # version.lds symbol versioning (AMDROCM_SYSDEPS_1.0) intentionally
++        # dropped here: whether supplied via the LDFLAGS env var or the
++        # -Dc_link_args= built-in option, meson's own compiler sanity check
++        # (run once per `setup`, including on `--reconfigure`) applies the
++        # -Wl,--version-script=... flag to its generated sanity-check
++        # command line *twice* - visible directly in CI logs, reproduced
++        # identically both ways - and ld then rejects the duplicate tag.
++        # This is meson 1.12.0's own sanity-check construction, not
++        # something under our control from the setup command line. The
++        # versioning exists to avoid symbol clashes if a distro-installed
++        # libpciaccess is ALSO loaded into the same process as this bundled
++        # copy; for this repo's narrow, internally-consumed math-libs
++        # artifact that coexistence scenario isn't the deployment target,
++        # so accepting the loss is a reasonable trade for an actually
++        # buildable stage.
+   COMMAND
+     "${MESON_BUILD}" compile --verbose
+   COMMAND
