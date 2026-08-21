@@ -1,51 +1,60 @@
 diff --git a/third-party/sysdeps/linux/libdrm/CMakeLists.txt b/third-party/sysdeps/linux/libdrm/CMakeLists.txt
-index 9e3b96e..adc6353 100644
+index 9e3b96e..5b3f4e7 100644
 --- a/third-party/sysdeps/linux/libdrm/CMakeLists.txt
 +++ b/third-party/sysdeps/linux/libdrm/CMakeLists.txt
-@@ -78,6 +78,21 @@ add_custom_target(
-   COMMAND
-     # Inline the amdgpu device table.
-     "${CMAKE_CURRENT_SOURCE_DIR}/inline_amdgpu_ids.sh" "${PATCH_SOURCE_DIR}"
-+  COMMAND
-+    # Force a fresh meson setup every invocation: if this custom target runs
-+    # more than once within the same configure (TheRock's own cmake
-+    # auto-reconfigure re-invokes ninja's build graph at least once per job),
-+    # `meson setup --reconfigure` on an already-configured build dir merges
-+    # our LDFLAGS-supplied -Wl,--version-script with the one it already
-+    # persisted from the prior invocation instead of replacing it, which
-+    # binutils' ld then rejects with "duplicate version tag" (hit for real in
-+    # therock-gfx1151's libpciaccess sibling build - same mechanism applies
-+    # here). Wiping meson's own state dirs (not the whole binary dir, which
-+    # cmake also uses) makes --reconfigure a no-op and every setup fresh.
-+    "${CMAKE_COMMAND}" -E rm -rf --
-+      "${CMAKE_CURRENT_BINARY_DIR}/meson-private"
-+      "${CMAKE_CURRENT_BINARY_DIR}/meson-info"
-+      "${CMAKE_CURRENT_BINARY_DIR}/meson-logs"
+@@ -81,8 +81,6 @@ add_custom_target(
    COMMAND
      "${CMAKE_COMMAND}" -E chdir "${PATCH_SOURCE_DIR}"
      "${CMAKE_COMMAND}" -E env
+-      # Escaping hack: experimentally determined to persist through the layers.
+-      "LDFLAGS=-Wl,-rpath='$$ORIGIN' -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/version.lds"
+       "CC=${_meson_cc}"
+       "CXX=${_meson_cxx}"
+       --
+@@ -100,6 +98,16 @@ add_custom_target(
+         -Dnouveau=disabled
+         -Dradeon=disabled
+         -Dvmwgfx=disabled
++        # rpath + symbol versioning (was LDFLAGS env var; escaping hack
++        # experimentally determined to persist through the layers). Moved to
++        # a meson built-in option: meson's compiler sanity check (run once
++        # per `setup`, including on `--reconfigure`) duplicates env-derived
++        # link args onto its generated sanity-check command line - harmless
++        # for most flags, but ld rejects the same --version-script tag
++        # applied twice with "duplicate version tag" (hit for real in this
++        # repo's libpciaccess sibling build, which uses the same mechanism).
++        # c_link_args goes through meson's normal single-application path.
++        "-Dc_link_args=-Wl,-rpath='$$ORIGIN' -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/version.lds"
+   COMMAND
+     "${MESON_BUILD}" compile --verbose
+   COMMAND
 diff --git a/third-party/sysdeps/linux/libpciaccess/CMakeLists.txt b/third-party/sysdeps/linux/libpciaccess/CMakeLists.txt
-index 78e8a29..f6dbe15 100644
+index 78e8a29..0bb1a38 100644
 --- a/third-party/sysdeps/linux/libpciaccess/CMakeLists.txt
 +++ b/third-party/sysdeps/linux/libpciaccess/CMakeLists.txt
-@@ -75,6 +75,20 @@ add_custom_target(
-     ${patch_source_commands}
-   COMMAND
-     "${CMAKE_COMMAND}" -E rm -rf -- "${CMAKE_INSTALL_PREFIX}"
-+  COMMAND
-+    # Force a fresh meson setup every invocation: if this custom target runs
-+    # more than once within the same configure (TheRock's own cmake
-+    # auto-reconfigure re-invokes ninja's build graph at least once per job),
-+    # `meson setup --reconfigure` on an already-configured build dir merges
-+    # our LDFLAGS-supplied -Wl,--version-script with the one it already
-+    # persisted from the prior invocation instead of replacing it, which
-+    # binutils' ld then rejects with "duplicate version tag". Wiping meson's
-+    # own state dirs (not the whole binary dir, which cmake also uses) makes
-+    # --reconfigure a no-op and every setup effectively fresh.
-+    "${CMAKE_COMMAND}" -E rm -rf --
-+      "${CMAKE_CURRENT_BINARY_DIR}/meson-private"
-+      "${CMAKE_CURRENT_BINARY_DIR}/meson-info"
-+      "${CMAKE_CURRENT_BINARY_DIR}/meson-logs"
-   COMMAND
-     # Meson refuses to build if the source dir is a subdir of the build dir.
+@@ -80,8 +80,6 @@ add_custom_target(
      # Run meson from the source directory to avoid this issue.
+     "${CMAKE_COMMAND}" -E chdir "${SOURCE_DIR}"
+     "${CMAKE_COMMAND}" -E env
+-      # Apply symbol versioning via version.lds. RPATH is set post-install via patch_install.py.
+-      "LDFLAGS=-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/version.lds"
+       "CC=${_meson_cc}"
+       "CXX=${_meson_cxx}"
+       --
+@@ -93,6 +91,16 @@ add_custom_target(
+         -Dpkgconfig.relocatable=true
+         -Dlibdir=lib
+         -Dzlib=disabled
++        # Apply symbol versioning via version.lds (RPATH is set post-install
++        # via patch_install.py). Passed as a meson built-in option rather
++        # than via the LDFLAGS env var: meson's compiler sanity check (run
++        # once per `setup`, including on `--reconfigure`) duplicates
++        # env-derived link args onto its generated sanity-check command
++        # line - harmless for most flags, but ld rejects the same
++        # --version-script tag applied twice with "duplicate version tag".
++        # c_link_args goes through meson's normal single-application path
++        # instead, sidestepping the duplication entirely.
++        "-Dc_link_args=-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/version.lds"
+   COMMAND
+     "${MESON_BUILD}" compile --verbose
+   COMMAND
