@@ -1,0 +1,51 @@
+diff --git a/third-party/sysdeps/linux/libdrm/CMakeLists.txt b/third-party/sysdeps/linux/libdrm/CMakeLists.txt
+index 9e3b96e..adc6353 100644
+--- a/third-party/sysdeps/linux/libdrm/CMakeLists.txt
++++ b/third-party/sysdeps/linux/libdrm/CMakeLists.txt
+@@ -78,6 +78,21 @@ add_custom_target(
+   COMMAND
+     # Inline the amdgpu device table.
+     "${CMAKE_CURRENT_SOURCE_DIR}/inline_amdgpu_ids.sh" "${PATCH_SOURCE_DIR}"
++  COMMAND
++    # Force a fresh meson setup every invocation: if this custom target runs
++    # more than once within the same configure (TheRock's own cmake
++    # auto-reconfigure re-invokes ninja's build graph at least once per job),
++    # `meson setup --reconfigure` on an already-configured build dir merges
++    # our LDFLAGS-supplied -Wl,--version-script with the one it already
++    # persisted from the prior invocation instead of replacing it, which
++    # binutils' ld then rejects with "duplicate version tag" (hit for real in
++    # therock-gfx1151's libpciaccess sibling build - same mechanism applies
++    # here). Wiping meson's own state dirs (not the whole binary dir, which
++    # cmake also uses) makes --reconfigure a no-op and every setup fresh.
++    "${CMAKE_COMMAND}" -E rm -rf --
++      "${CMAKE_CURRENT_BINARY_DIR}/meson-private"
++      "${CMAKE_CURRENT_BINARY_DIR}/meson-info"
++      "${CMAKE_CURRENT_BINARY_DIR}/meson-logs"
+   COMMAND
+     "${CMAKE_COMMAND}" -E chdir "${PATCH_SOURCE_DIR}"
+     "${CMAKE_COMMAND}" -E env
+diff --git a/third-party/sysdeps/linux/libpciaccess/CMakeLists.txt b/third-party/sysdeps/linux/libpciaccess/CMakeLists.txt
+index 78e8a29..f6dbe15 100644
+--- a/third-party/sysdeps/linux/libpciaccess/CMakeLists.txt
++++ b/third-party/sysdeps/linux/libpciaccess/CMakeLists.txt
+@@ -75,6 +75,20 @@ add_custom_target(
+     ${patch_source_commands}
+   COMMAND
+     "${CMAKE_COMMAND}" -E rm -rf -- "${CMAKE_INSTALL_PREFIX}"
++  COMMAND
++    # Force a fresh meson setup every invocation: if this custom target runs
++    # more than once within the same configure (TheRock's own cmake
++    # auto-reconfigure re-invokes ninja's build graph at least once per job),
++    # `meson setup --reconfigure` on an already-configured build dir merges
++    # our LDFLAGS-supplied -Wl,--version-script with the one it already
++    # persisted from the prior invocation instead of replacing it, which
++    # binutils' ld then rejects with "duplicate version tag". Wiping meson's
++    # own state dirs (not the whole binary dir, which cmake also uses) makes
++    # --reconfigure a no-op and every setup effectively fresh.
++    "${CMAKE_COMMAND}" -E rm -rf --
++      "${CMAKE_CURRENT_BINARY_DIR}/meson-private"
++      "${CMAKE_CURRENT_BINARY_DIR}/meson-info"
++      "${CMAKE_CURRENT_BINARY_DIR}/meson-logs"
+   COMMAND
+     # Meson refuses to build if the source dir is a subdir of the build dir.
+     # Run meson from the source directory to avoid this issue.

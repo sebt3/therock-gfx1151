@@ -68,6 +68,22 @@ Split across repos by what actually needs to move together:
   Renamed from `therock-primlibs-benchmark-deps` to match upstream's own
   file rename between `a512f42` and `therock-7.14`. No-op for this repo's
   config (`THEROCK_BUILD_TESTING=OFF`), kept applied for parity.
+- `therock-mesondeps-reconfigure-dedup` — TheRock's own build system
+  reconfigures the whole cmake tree at least twice per CI job (once for our
+  explicit `Configure` step, once automatically when ninja detects the
+  build graph is stale). For the meson-based sysdeps that inject a
+  `-Wl,--version-script=...` via the `LDFLAGS` env var (libpciaccess,
+  libdrm), the second `meson setup --reconfigure` merges that flag with the
+  one already persisted from the first invocation instead of replacing it,
+  and binutils' `ld` then rejects the resulting command line with
+  `duplicate version tag`. Hit for real in CI (libpciaccess failed a
+  from-scratch build this way). Fix: wipe meson's own state directories
+  (`meson-private`/`meson-info`/`meson-logs`, not the whole binary dir,
+  which cmake also uses) before each setup, so `--reconfigure` is always a
+  no-op and there's nothing to merge into. amd-mesa has the same pattern
+  but is unreachable here (`THEROCK_ENABLE_MEDIA_LIBS=OFF`); util-linux
+  uses a different mechanism (patches `.sym` files directly rather than an
+  env var) and isn't affected.
 
 Dropped: a `roctx64`/`roctracer.h` super-project-resolution fix that lived
 inline in the old `vllm-packages.yaml` (not upstream gfx115x — authored
